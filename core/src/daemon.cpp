@@ -1,8 +1,64 @@
 #include <chrono>
-#include <fcntl.h>
 #include <iostream>
-#include <linux/videodev2.h>
 #include <opencv2/opencv.hpp>
+
+#ifdef _WIN32
+// ==========================================
+// ARQUITECTURA WINDOWS (DirectShow / MSMF)
+// ==========================================
+#include <windows.h>
+
+int main() {
+  // En Windows, '0' selecciona la cámara por defecto usando el backend nativo
+  cv::VideoCapture cap(0);
+  if (!cap.isOpened()) {
+    std::cerr << "Falla estructural: Imposible adquirir cámara en Windows."
+              << std::endl;
+    return 1;
+  }
+
+  cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
+  cap.set(cv::CAP_PROP_FRAME_HEIGHT, 360);
+  cap.set(cv::CAP_PROP_FPS, 15);
+
+  cv::Mat frame;
+  const int benchmark_frames = 600;
+  double total_latency = 0.0;
+
+  std::cout << "[BENCHMARK] Productor activo en Windows. Procesando frames..."
+            << std::endl;
+
+  for (int i = 0; i < benchmark_frames; ++i) {
+    cap.read(frame);
+    if (frame.empty())
+      break;
+
+    auto start = std::chrono::high_resolution_clock::now();
+
+    // Para Windows, de momento abrimos una ventana de debug en lugar de
+    // inyectar a una cámara virtual del kernel de Linux
+    cv::imshow("DirectLook - Debug Windows", frame);
+    cv::waitKey(1);
+
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> elapsed = end - start;
+    total_latency += elapsed.count();
+  }
+
+  std::cout << "Latencia promedio real: " << (total_latency / benchmark_frames)
+            << " ms" << std::endl;
+
+  cap.release();
+  cv::destroyAllWindows();
+  return 0;
+}
+
+#else
+// ==========================================
+// ARQUITECTURA LINUX (v4l2loopback nativo)
+// ==========================================
+#include <fcntl.h>
+#include <linux/videodev2.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 
@@ -14,7 +70,6 @@ int main() {
     return 1;
   }
 
-  // Degradación grácil estricta y destrucción de buffer histórico
   cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
   cap.set(cv::CAP_PROP_FRAME_HEIGHT, 360);
   cap.set(cv::CAP_PROP_FPS, 15);
@@ -27,7 +82,6 @@ int main() {
     return 1;
   }
 
-  // Negociación V4L2 estricta
   struct v4l2_format fmt = {0};
   fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
   fmt.fmt.pix.width = 640;
@@ -51,17 +105,14 @@ int main() {
             << std::endl;
 
   for (int i = 0; i < benchmark_frames; ++i) {
-    // 1. Espera de Hardware (Fuera del temporizador)
     cap.read(frame);
     if (frame.empty())
       break;
 
-    // 2. Medición Estructural Pura (Zero-Copy)
     auto start = std::chrono::high_resolution_clock::now();
-
     write(fd, frame.data, frame.total() * frame.elemSize());
-
     auto end = std::chrono::high_resolution_clock::now();
+
     std::chrono::duration<double, std::milli> elapsed = end - start;
     total_latency += elapsed.count();
   }
@@ -73,3 +124,4 @@ int main() {
   cap.release();
   return 0;
 }
+#endif
