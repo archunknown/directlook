@@ -4,3 +4,5 @@ models/onnxruntime*
 *.onnx
 *.bin.cache/
 build/
+.cache/clangd/index
+
