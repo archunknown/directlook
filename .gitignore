@@ -2,4 +2,5 @@ build/
 .cmake/
 models/onnxruntime*
 *.onnx
-*.bin
+*.bin.cache/
+build/
