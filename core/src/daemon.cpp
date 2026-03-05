@@ -1,8 +1,3 @@
-// =============================================================================
-// DirectLook — Daemon Core (Multiplataforma: Windows + Linux)
-// Sprint 1: Monitor de Memoria · ONNX Runtime · Transmutación Tensorial
-// =============================================================================
-// --- Includes comunes (agnósticos de plataforma) ---
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -31,9 +26,7 @@
 
 #endif
 
-// =============================================================================
 // Constantes arquitectónicas
-// =============================================================================
 static constexpr size_t MEMORY_LIMIT_BYTES = 80 * 1024 * 1024; // 80 MB
 static const std::string MODEL_PATH = "modelos/pfld.onnx";
 static const std::string FACE_MODEL_PATH =
@@ -43,10 +36,7 @@ static const std::string FACE_MODEL_PATH =
 static constexpr int MODEL_SIZE = 112;
 static constexpr int TENSOR_ELEMENTS = 1 * 3 * MODEL_SIZE * MODEL_SIZE;
 
-// =============================================================================
 // [FASE 1] Monitor de Memoria Multiplataforma
-// =============================================================================
-
 size_t getProcessMemory() {
 #ifdef _WIN32
   PROCESS_MEMORY_COUNTERS_EX pmcEx;
@@ -71,18 +61,12 @@ size_t getProcessMemory() {
 #endif
 }
 
-// =============================================================================
 // [FASE 3] Transmutación de Tensores: BGR/HWC → RGB/NCHW float [0.0, 1.0]
-// Resize a 112x112, conversión de color, transposición y normalización
-// en un solo pase con punteros directos. El buffer y el cv::Mat de resize
-// se reciben pre-alocados para evitar allocations por frame.
-// =============================================================================
+
 void preprocessFrame(const cv::Mat &frame, cv::Mat &resized, float *buffer) {
-  // 1. Resize forzado a las dimensiones del modelo (reutiliza memoria de
-  // resized)
   cv::resize(frame, resized, cv::Size(MODEL_SIZE, MODEL_SIZE));
   const int planeSize = MODEL_SIZE * MODEL_SIZE;
-  // Punteros directos a los planos R, G, B en layout NCHW
+
   float *rPlane = buffer;
   float *gPlane = buffer + planeSize;
   float *bPlane = buffer + 2 * planeSize;
@@ -101,10 +85,9 @@ void preprocessFrame(const cv::Mat &frame, cv::Mat &resized, float *buffer) {
   }
 }
 
-// =============================================================================
 // Generador de Prior Boxes para UltraFace SSD (slim-320)
 // Produce 4420 anchors basados en feature maps [30x40, 15x20, 8x10, 4x5]
-// =============================================================================
+
 std::vector<std::array<float, 4>> generateUltraFacePriors(int imgW, int imgH) {
   std::vector<std::array<float, 4>> priors;
   const int strides[] = {8, 16, 32, 64};
@@ -133,15 +116,11 @@ std::vector<std::array<float, 4>> generateUltraFacePriors(int imgW, int imgH) {
   return priors;
 }
 
-// =============================================================================
 // Arquitecturas de plataforma (main separados)
-// =============================================================================
 
 #ifdef _WIN32
 
-// =====================================================================
 // ARQUITECTURA WINDOWS (DirectShow / MSMF)
-// =====================================================================
 
 int main() {
   std::cout << "=== DirectLook Daemon [Windows] ===" << std::endl;
@@ -149,9 +128,7 @@ int main() {
   size_t memInicio = getProcessMemory();
   std::cout << "[MEMORIA] Inicio del proceso: "
             << (memInicio / (1024.0 * 1024.0)) << " MB" << std::endl;
-  // -----------------------------------------------------------------
-  // [FASE 2] Instanciación del Motor ONNX Runtime (CPU / AVX2)
-  // -----------------------------------------------------------------
+
   Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "DirectLookDaemon");
   Ort::SessionOptions sessionOpts;
 
@@ -206,9 +183,8 @@ int main() {
     std::cout << "[ONNX] Continuando en modo benchmark (sin inferencia)."
               << std::endl;
   }
-  // -----------------------------------------------------------------
+
   // Captura de video
-  // -----------------------------------------------------------------
 
   cv::VideoCapture cap(0);
   if (!cap.isOpened()) {
@@ -221,9 +197,8 @@ int main() {
   cap.set(cv::CAP_PROP_FRAME_HEIGHT, 360);
   cap.set(cv::CAP_PROP_FPS, 15);
 
-  // -----------------------------------------------------------------
   // Detector facial UltraFace ONNX (reemplaza Haar cascade)
-  // -----------------------------------------------------------------
+
   static constexpr int UF_W = 320, UF_H = 240;
   static constexpr int UF_ELEMENTS = 1 * 3 * UF_H * UF_W;
   std::unique_ptr<Ort::Session> faceSession;
@@ -267,13 +242,10 @@ int main() {
     }
   }
 
-  // -----------------------------------------------------------------
   // Loop de benchmark + preprocesamiento tensorial + inferencia
-  // -----------------------------------------------------------------
-
   cv::Mat frame;
   cv::Mat resized;
-  cv::Mat ufResized; // Pre-alocado para resize de UltraFace
+  cv::Mat ufResized;
   const int benchmark_frames = 600;
   double total_latency = 0.0;
   int frames_processed = 0;
@@ -486,10 +458,7 @@ int main() {
     }
   }
 
-  // -----------------------------------------------------------------
   // Reporte final
-  // -----------------------------------------------------------------
-
   std::cout << std::endl;
   if (frames_processed > 0) {
     std::cout << "[RESULTADO] Frames: " << frames_processed << std::endl;
@@ -508,9 +477,8 @@ int main() {
 }
 
 #else
-// =====================================================================
+
 // ARQUITECTURA LINUX (v4l2loopback nativo)
-// =====================================================================
 
 int main() {
   std::cout << "=== DirectLook Daemon [Linux] ===" << std::endl;
@@ -520,9 +488,7 @@ int main() {
   std::cout << "[MEMORIA] Inicio del proceso: "
             << (memInicio / (1024.0 * 1024.0)) << " MB" << std::endl;
 
-  // -----------------------------------------------------------------
   // [FASE 2] Instanciación del Motor ONNX Runtime (CPU / AVX2)
-  // -----------------------------------------------------------------
   Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "DirectLookDaemon");
 
   Ort::SessionOptions sessionOpts;
@@ -556,9 +522,8 @@ int main() {
               << std::endl;
   }
 
-  // -----------------------------------------------------------------
-  // Captura de video + cámara virtual
-  // -----------------------------------------------------------------
+  // Captura de video + cámara virtual (/dev/video2)
+
   cv::VideoCapture cap(0, cv::CAP_V4L2);
   if (!cap.isOpened()) {
     std::cerr << "Falla estructural: Imposible adquirir /dev/video0."
@@ -592,63 +557,85 @@ int main() {
     return 1;
   }
 
-  // -----------------------------------------------------------------
-  // Loop de benchmark + preprocesamiento tensorial + inferencia
-  // -----------------------------------------------------------------
+  // CARGA DE MODELO ULTRAFACE ONNX
+  std::unique_ptr<Ort::Session> faceSession;
+  bool faceDetectorOk = false;
+
+  try {
+    faceSession = std::make_unique<Ort::Session>(env, FACE_MODEL_PATH.c_str(),
+                                                 sessionOpts);
+    faceDetectorOk = true;
+    std::cout << "[FACE] UltraFace cargado: " << FACE_MODEL_PATH << std::endl;
+  } catch (const Ort::Exception &e) {
+    std::cerr << "[FACE] No se pudo cargar UltraFace: " << e.what()
+              << std::endl;
+  }
+
+  // Dimensiones UltraFace
+  const int UF_W = 320;
+  const int UF_H = 240;
+  std::vector<float> ufTensorData(1 * 3 * UF_H * UF_W);
+  std::array<int64_t, 4> ufShape = {1, 3, UF_H, UF_W};
+  auto ufMemInfo =
+      Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+
+  Ort::Value ufInputTensor = Ort::Value::CreateTensor<float>(
+      ufMemInfo, ufTensorData.data(), ufTensorData.size(), ufShape.data(),
+      ufShape.size());
+
+  const char *ufInputName = nullptr;
+  std::vector<const char *> ufOutputNames;
+  Ort::AllocatedStringPtr ufInName(nullptr,
+                                   Ort::detail::AllocatedFree{nullptr});
+  std::vector<Ort::AllocatedStringPtr> ufOutNames;
+
+  // Generar boxes a priori una sola vez
+  auto ufPriors = generateUltraFacePriors(UF_W, UF_H);
+
+  if (faceDetectorOk && faceSession) {
+    Ort::AllocatorWithDefaultOptions ufAlloc;
+    ufInName = faceSession->GetInputNameAllocated(0, ufAlloc);
+    ufInputName = ufInName.get();
+
+    for (size_t i = 0; i < faceSession->GetOutputCount(); ++i) {
+      ufOutNames.push_back(faceSession->GetOutputNameAllocated(i, ufAlloc));
+      ufOutputNames.push_back(ufOutNames.back().get());
+    }
+  }
+
+  // Buffers PFLD
   cv::Mat frame;
   cv::Mat resized;
+  cv::Mat ufResized;
   const int benchmark_frames = 600;
   double total_latency = 0.0;
   int frames_processed = 0;
 
-  // Buffers pre-alocados FUERA del bucle
+  // Buffers PFLD pre-alocados
   std::vector<float> tensorData(TENSOR_ELEMENTS);
   std::array<int64_t, 4> inputShape = {1, 3, MODEL_SIZE, MODEL_SIZE};
   auto memInfo =
       Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 
-  // Nombres cacheados
   const char *cachedInputName = nullptr;
+  const char *cachedOutputName = nullptr;
   Ort::AllocatorWithDefaultOptions alloc;
   Ort::AllocatedStringPtr inNameHolder(nullptr,
                                        Ort::detail::AllocatedFree{nullptr});
+  Ort::AllocatedStringPtr outNameHolder(nullptr,
+                                        Ort::detail::AllocatedFree{nullptr});
   Ort::RunOptions runOpts;
 
-  // Tensor de entrada creado UNA vez (zero-copy sobre tensorData)
+  // Tensor PFLD
   Ort::Value inputTensor = Ort::Value::CreateTensor<float>(
       memInfo, tensorData.data(), tensorData.size(), inputShape.data(),
       inputShape.size());
 
-  // Tensores de salida pre-alocados para TODAS las salidas
-  std::vector<std::vector<float>> outputBuffers;
-  std::vector<Ort::Value> outputTensors;
-  std::vector<Ort::AllocatedStringPtr> outNameHolders;
-  std::unique_ptr<Ort::IoBinding> ioBinding;
-
   if (modelLoaded && session) {
     inNameHolder = session->GetInputNameAllocated(0, alloc);
+    outNameHolder = session->GetOutputNameAllocated(1, alloc);
     cachedInputName = inNameHolder.get();
-
-    size_t numOutputs = session->GetOutputCount();
-    ioBinding = std::make_unique<Ort::IoBinding>(*session);
-    ioBinding->BindInput(cachedInputName, inputTensor);
-
-    for (size_t i = 0; i < numOutputs; ++i) {
-      auto nameHolder = session->GetOutputNameAllocated(i, alloc);
-      auto outInfo = session->GetOutputTypeInfo(i).GetTensorTypeAndShapeInfo();
-      auto outShape = outInfo.GetShape();
-      size_t outSize = 1;
-      for (auto &dim : outShape)
-        outSize *= (dim < 0) ? 1 : static_cast<size_t>(dim);
-
-      outputBuffers.emplace_back(outSize);
-      outputTensors.push_back(Ort::Value::CreateTensor<float>(
-          memInfo, outputBuffers.back().data(), outputBuffers.back().size(),
-          outShape.data(), outShape.size()));
-
-      ioBinding->BindOutput(nameHolder.get(), outputTensors.back());
-      outNameHolders.push_back(std::move(nameHolder));
-    }
+    cachedOutputName = outNameHolder.get();
   }
 
   std::cout << "[BENCHMARK] Productor activo. Ejecuta 'mpv' en la segunda "
@@ -662,17 +649,127 @@ int main() {
 
     auto start = std::chrono::high_resolution_clock::now();
 
-    // [FASE 3] Transmutación tensorial (resize 448x448 + BGR→RGB + NCHW)
-    preprocessFrame(frame, resized, tensorData.data());
+    // [PASO 1] Detectar rostro y extraer ROI con UltraFace
+    cv::Rect roi;
+    bool faceFound = false;
 
-    // [FASE 2] Inferencia ONNX zero-copy via IoBinding
-    if (modelLoaded && session && ioBinding) {
-      try {
-        session->Run(runOpts, *ioBinding);
-      } catch (const Ort::Exception &e) {
-        std::cerr << "[ONNX] Error inferencia frame " << i << ": " << e.what()
-                  << std::endl;
+    if (faceDetectorOk && faceSession) {
+      cv::resize(frame, ufResized, cv::Size(UF_W, UF_H));
+      const int ufPlane = UF_H * UF_W;
+      float *ch0 = ufTensorData.data();
+      float *ch1 = ch0 + ufPlane;
+      float *ch2 = ch1 + ufPlane;
+
+      for (int y = 0; y < UF_H; ++y) {
+        const uint8_t *row = ufResized.ptr<uint8_t>(y);
+        for (int x = 0; x < UF_W; ++x) {
+          int idx = y * UF_W + x;
+          int px3 = x * 3;
+          ch0[idx] = (row[px3 + 0] - 127.0f) / 128.0f; // B
+          ch1[idx] = (row[px3 + 1] - 127.0f) / 128.0f; // G
+          ch2[idx] = (row[px3 + 2] - 127.0f) / 128.0f; // R
+        }
       }
+
+      try {
+        auto ufResults =
+            faceSession->Run(runOpts, &ufInputName, &ufInputTensor, 1,
+                             ufOutputNames.data(), ufOutputNames.size());
+
+        const float *scores = ufResults[0].GetTensorData<float>();
+        const float *boxes = ufResults[1].GetTensorData<float>();
+        int numAnchors = static_cast<int>(ufPriors.size());
+
+        float bestConf = 0.7f;
+        int bestIdx = -1;
+
+        for (int a = 0; a < numAnchors; ++a) {
+          float conf = scores[a * 2 + 1]; // [bg, face]
+          if (conf > bestConf) {
+            bestConf = conf;
+            bestIdx = a;
+          }
+        }
+
+        if (bestIdx >= 0) {
+          const float CENTER_VAR = 0.1f;
+          const float SIZE_VAR = 0.2f;
+          float pcx = ufPriors[bestIdx][0];
+          float pcy = ufPriors[bestIdx][1];
+          float pw = ufPriors[bestIdx][2];
+          float ph = ufPriors[bestIdx][3];
+
+          float cx = pcx + boxes[bestIdx * 4 + 0] * CENTER_VAR * pw;
+          float cy = pcy + boxes[bestIdx * 4 + 1] * CENTER_VAR * ph;
+          float bw = pw * std::exp(boxes[bestIdx * 4 + 2] * SIZE_VAR);
+          float bh = ph * std::exp(boxes[bestIdx * 4 + 3] * SIZE_VAR);
+
+          float bx1 = cx - bw / 2.0f;
+          float by1 = cy - bh / 2.0f;
+          float bx2 = cx + bw / 2.0f;
+          float by2 = cy + bh / 2.0f;
+
+          int x1 = static_cast<int>(bx1 * frame.cols);
+          int y1 = static_cast<int>(by1 * frame.rows);
+          int x2 = static_cast<int>(bx2 * frame.cols);
+          int y2 = static_cast<int>(by2 * frame.rows);
+
+          int w = x2 - x1, h = y2 - y1;
+          if (w > 10 && h > 10) {
+            int padW = w / 10, padH = h / 10;
+            x1 = std::max(0, x1 - padW);
+            y1 = std::max(0, y1 - padH);
+            x2 = std::min(frame.cols, x2 + padW);
+            y2 = std::min(frame.rows, y2 + padH);
+            roi = cv::Rect(x1, y1, x2 - x1, y2 - y1);
+            faceFound = true;
+          }
+        }
+      } catch (const Ort::Exception &e) {
+        std::cerr << "[FACE] Error UltraFace: " << e.what() << std::endl;
+      }
+    }
+
+    if (faceFound) {
+      cv::rectangle(frame, roi, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+
+      // [PASO 2] Recortar cara y preprocesar para PFLD
+      cv::Mat faceCrop = frame(roi);
+      preprocessFrame(faceCrop, resized, tensorData.data());
+
+      // [PASO 3] Inferencia ONNX (PFLD: 98 landmarks)
+      if (modelLoaded && session) {
+        try {
+          auto results = session->Run(runOpts, &cachedInputName, &inputTensor,
+                                      1, &cachedOutputName, 1);
+
+          const float *landmarks = results[0].GetTensorData<float>();
+
+          for (int p = 0; p < 98; ++p) {
+            float pfld_x = landmarks[p * 2];
+            float pfld_y = landmarks[p * 2 + 1];
+
+            int final_x = roi.x + static_cast<int>(pfld_x * roi.width);
+            int final_y = roi.y + static_cast<int>(pfld_y * roi.height);
+
+            bool isEyeOrPupil = (p >= 60 && p <= 75) || (p >= 96 && p <= 97);
+            cv::Scalar color =
+                isEyeOrPupil ? cv::Scalar(0, 0, 255) : cv::Scalar(0, 255, 0);
+            int radius = isEyeOrPupil ? 3 : 2;
+
+            cv::circle(frame, cv::Point(final_x, final_y), radius, color, -1,
+                       cv::LINE_AA);
+          }
+
+        } catch (const Ort::Exception &e) {
+          std::cerr << "[ONNX] Error inferencia frame " << i << ": " << e.what()
+                    << std::endl;
+        }
+      }
+    } else {
+      cv::putText(frame, "ESTADO: BUSCANDO ROSTRO...", cv::Point(10, 40),
+                  cv::FONT_HERSHEY_SIMPLEX, 0.9, cv::Scalar(0, 0, 255), 2,
+                  cv::LINE_AA);
     }
 
     // Escritura a cámara virtual v4l2loopback
@@ -692,9 +789,7 @@ int main() {
     }
   }
 
-  // -----------------------------------------------------------------
   // Reporte final
-  // -----------------------------------------------------------------
   std::cout << std::endl;
   if (frames_processed > 0) {
     std::cout << "[RESULTADO] Frames: " << frames_processed << std::endl;
