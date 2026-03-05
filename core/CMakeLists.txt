@@ -2,7 +2,7 @@ find_package(OpenCV REQUIRED)
 
 # --- ONNX Runtime: rutas condicionales por plataforma ---
 if(WIN32)
-    set(ONNXRUNTIME_ROOT ${CMAKE_SOURCE_DIR}/models/onnxruntime-win-x64-1.16.3)
+    set(ONNXRUNTIME_ROOT ${CMAKE_SOURCE_DIR}/models/onnxruntime-win-x64-1.24.2)
 else()
     set(ONNXRUNTIME_ROOT ${CMAKE_SOURCE_DIR}/models/onnxruntime-linux-x64-1.16.3)
 endif()
