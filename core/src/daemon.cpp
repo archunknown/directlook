@@ -358,8 +358,8 @@ int main() {
   bool connectPending = false;
 
   if (hPipe == INVALID_HANDLE_VALUE) {
-    std::cerr << "[IPC] Error creando Named Pipe: " << GetLastError()
-              << std::endl;
+    throw std::runtime_error(
+        "Falla cr\u00edtica: Imposible instanciar Named Pipe IPC.");
   } else {
     std::cout << "[IPC] Named Pipe creado: " << DIRECTLOOK_PIPE_NAME
               << std::endl;
@@ -437,7 +437,7 @@ int main() {
 
     cap.read(frame);
     if (frame.empty()) {
-      std::this_thread::yield();
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
       continue;
     }
 
@@ -793,31 +793,29 @@ int main() {
   bool effectEnabled = true;
 
   if (sockFd < 0) {
-    std::cerr << "[IPC] Error creando socket UNIX." << std::endl;
-  } else {
-    // Limpiar socket obsoleto antes de bind
-    unlink(DIRECTLOOK_SOCK_PATH);
-
-    struct sockaddr_un addr;
-    std::memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    std::strncpy(addr.sun_path, DIRECTLOOK_SOCK_PATH,
-                 sizeof(addr.sun_path) - 1);
-
-    if (bind(sockFd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) <
-        0) {
-      std::cerr << "[IPC] Error en bind: " << DIRECTLOOK_SOCK_PATH << std::endl;
-      close(sockFd);
-      sockFd = -1;
-    } else if (listen(sockFd, 1) < 0) {
-      std::cerr << "[IPC] Error en listen." << std::endl;
-      close(sockFd);
-      sockFd = -1;
-    } else {
-      std::cout << "[IPC] Socket UNIX creado: " << DIRECTLOOK_SOCK_PATH
-                << std::endl;
-    }
+    throw std::runtime_error(
+        "Falla cr\u00edtica: Imposible instanciar Socket UNIX IPC.");
   }
+
+  // Limpiar socket obsoleto antes de bind
+  unlink(DIRECTLOOK_SOCK_PATH);
+
+  struct sockaddr_un addr;
+  std::memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  std::strncpy(addr.sun_path, DIRECTLOOK_SOCK_PATH, sizeof(addr.sun_path) - 1);
+
+  if (bind(sockFd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) <
+      0) {
+    throw std::runtime_error(
+        "Falla cr\u00edtica: Imposible instanciar Socket UNIX IPC.");
+  }
+  if (listen(sockFd, 1) < 0) {
+    throw std::runtime_error(
+        "Falla cr\u00edtica: Imposible instanciar Socket UNIX IPC.");
+  }
+  std::cout << "[IPC] Socket UNIX creado: " << DIRECTLOOK_SOCK_PATH
+            << std::endl;
 
   // -----------------------------------------------------------------
   // Bucle principal perpetuo
@@ -855,7 +853,7 @@ int main() {
 
     cap.read(frame);
     if (frame.empty()) {
-      std::this_thread::yield();
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
       continue;
     }
 
