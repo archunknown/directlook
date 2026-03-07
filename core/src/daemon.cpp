@@ -113,6 +113,11 @@ std::string FACE_MODEL_PATH;
 static constexpr int MODEL_SIZE = 112;
 static constexpr int TENSOR_ELEMENTS = 1 * 3 * MODEL_SIZE * MODEL_SIZE;
 
+// Dimensiones exigidas por el modelo UltraFace (320x240)
+static constexpr int UF_W = 320;
+static constexpr int UF_H = 240;
+static constexpr int UF_ELEMENTS = 1 * 3 * UF_H * UF_W;
+
 // =============================================================================
 // [FASE 1] Monitor de Memoria Multiplataforma
 // =============================================================================
@@ -179,6 +184,141 @@ std::vector<std::array<float, 4>> generateUltraFacePriors(int imgW, int imgH) {
     }
   }
   return priors;
+}
+
+// =============================================================================
+// Pipeline de Visión Agnóstico (Inferencia Conjunta)
+// =============================================================================
+void processVisionPipeline(cv::Mat &frame, bool effectEnabled,
+                           bool faceDetectorOk, Ort::Session *faceSession,
+                           cv::Mat &ufResized, std::vector<float> &ufTensorData,
+                           const char *ufInputName, Ort::Value &ufInputTensor,
+                           const std::vector<const char *> &ufOutputNames,
+                           const std::vector<std::array<float, 4>> &ufPriors,
+                           bool modelLoaded, Ort::Session *session,
+                           const char *cachedInputName, Ort::Value &inputTensor,
+                           const char *cachedOutputName,
+                           const Ort::RunOptions &runOpts,
+                           std::vector<float> &tensorData, cv::Mat &resized) {
+
+  cv::Rect roi;
+  bool faceFound = false;
+
+  if (effectEnabled && faceDetectorOk && faceSession) {
+    cv::resize(frame, ufResized, cv::Size(UF_W, UF_H));
+    const int ufPlane = UF_H * UF_W;
+    float *ch0 = ufTensorData.data();
+    float *ch1 = ch0 + ufPlane;
+    float *ch2 = ch1 + ufPlane;
+
+    for (int y = 0; y < UF_H; ++y) {
+      const uint8_t *row = ufResized.ptr<uint8_t>(y);
+      for (int x = 0; x < UF_W; ++x) {
+        int idx = y * UF_W + x;
+        int px3 = x * 3;
+        ch0[idx] = (row[px3 + 0] - 127.0f) / 128.0f;
+        ch1[idx] = (row[px3 + 1] - 127.0f) / 128.0f;
+        ch2[idx] = (row[px3 + 2] - 127.0f) / 128.0f;
+      }
+    }
+
+    try {
+      auto ufResults =
+          faceSession->Run(runOpts, &ufInputName, &ufInputTensor, 1,
+                           ufOutputNames.data(), ufOutputNames.size());
+
+      const float *scores = ufResults[0].GetTensorData<float>();
+      const float *boxes = ufResults[1].GetTensorData<float>();
+      int numAnchors = static_cast<int>(ufPriors.size());
+
+      float bestConf = 0.7f;
+      int bestIdx = -1;
+
+      for (int a = 0; a < numAnchors; ++a) {
+        float conf = scores[a * 2 + 1];
+        if (conf > bestConf) {
+          bestConf = conf;
+          bestIdx = a;
+        }
+      }
+
+      if (bestIdx >= 0) {
+        const float CENTER_VAR = 0.1f;
+        const float SIZE_VAR = 0.2f;
+        float pcx = ufPriors[bestIdx][0];
+        float pcy = ufPriors[bestIdx][1];
+        float pw = ufPriors[bestIdx][2];
+        float ph = ufPriors[bestIdx][3];
+
+        float cx = pcx + boxes[bestIdx * 4 + 0] * CENTER_VAR * pw;
+        float cy = pcy + boxes[bestIdx * 4 + 1] * CENTER_VAR * ph;
+        float bw = pw * std::exp(boxes[bestIdx * 4 + 2] * SIZE_VAR);
+        float bh = ph * std::exp(boxes[bestIdx * 4 + 3] * SIZE_VAR);
+
+        float bx1 = cx - bw / 2.0f;
+        float by1 = cy - bh / 2.0f;
+        float bx2 = cx + bw / 2.0f;
+        float by2 = cy + bh / 2.0f;
+
+        int x1 = static_cast<int>(bx1 * frame.cols);
+        int y1 = static_cast<int>(by1 * frame.rows);
+        int x2 = static_cast<int>(bx2 * frame.cols);
+        int y2 = static_cast<int>(by2 * frame.rows);
+
+        int w = x2 - x1, h = y2 - y1;
+        if (w > 10 && h > 10) {
+          int padW = w / 10, padH = h / 10;
+          x1 = std::max(0, x1 - padW);
+          y1 = std::max(0, y1 - padH);
+          x2 = std::min(frame.cols, x2 + padW);
+          y2 = std::min(frame.rows, y2 + padH);
+          roi = cv::Rect(x1, y1, x2 - x1, y2 - y1);
+          faceFound = true;
+        }
+      }
+    } catch (const Ort::Exception &e) {
+      std::cerr << "[FACE] Error UltraFace: " << e.what() << std::endl;
+    }
+  }
+
+  if (faceFound) {
+    cv::rectangle(frame, roi, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+
+    cv::Mat faceCrop = frame(roi);
+    preprocessFrame(faceCrop, resized, tensorData.data());
+
+    if (modelLoaded && session) {
+      try {
+        auto results = session->Run(runOpts, &cachedInputName, &inputTensor, 1,
+                                    &cachedOutputName, 1);
+
+        const float *landmarks = results[0].GetTensorData<float>();
+
+        for (int p = 0; p < 98; ++p) {
+          float pfld_x = landmarks[p * 2];
+          float pfld_y = landmarks[p * 2 + 1];
+
+          int final_x = roi.x + static_cast<int>(pfld_x * roi.width);
+          int final_y = roi.y + static_cast<int>(pfld_y * roi.height);
+
+          bool isEyeOrPupil = (p >= 60 && p <= 75) || (p >= 96 && p <= 97);
+          cv::Scalar color =
+              isEyeOrPupil ? cv::Scalar(0, 0, 255) : cv::Scalar(0, 255, 0);
+          int radius = isEyeOrPupil ? 3 : 2;
+
+          cv::circle(frame, cv::Point(final_x, final_y), radius, color, -1,
+                     cv::LINE_AA);
+        }
+
+      } catch (const Ort::Exception &e) {
+        std::cerr << "[ONNX] Error inferencia: " << e.what() << std::endl;
+      }
+    }
+  } else if (effectEnabled) {
+    cv::putText(frame, "ESTADO: BUSCANDO ROSTRO...", cv::Point(10, 40),
+                cv::FONT_HERSHEY_SIMPLEX, 0.9, cv::Scalar(0, 0, 255), 2,
+                cv::LINE_AA);
+  }
 }
 
 // =============================================================================
@@ -315,8 +455,6 @@ int main() {
     // -----------------------------------------------------------------
     // Detector facial UltraFace ONNX
     // -----------------------------------------------------------------
-    static constexpr int UF_W = 320, UF_H = 240;
-    static constexpr int UF_ELEMENTS = 1 * 3 * UF_H * UF_W;
     std::unique_ptr<Ort::Session> faceSession;
     bool faceDetectorOk = false;
 
@@ -501,127 +639,12 @@ int main() {
 
       auto start = std::chrono::high_resolution_clock::now();
 
-      // --- Pipeline de visión (solo si efecto habilitado) ---
-      cv::Rect roi;
-      bool faceFound = false;
-
-      if (effectEnabled && faceDetectorOk && faceSession) {
-        // [PASO 1] Preprocesar para UltraFace: resize 320x240, (px-127)/128,
-        // BGR
-        cv::resize(frame, ufResized, cv::Size(UF_W, UF_H));
-        const int ufPlane = UF_H * UF_W;
-        float *ch0 = ufTensorData.data();
-        float *ch1 = ch0 + ufPlane;
-        float *ch2 = ch1 + ufPlane;
-        for (int y = 0; y < UF_H; ++y) {
-          const uint8_t *row = ufResized.ptr<uint8_t>(y);
-          for (int x = 0; x < UF_W; ++x) {
-            int idx = y * UF_W + x;
-            int px3 = x * 3;
-            ch0[idx] = (row[px3 + 0] - 127.0f) / 128.0f; // B
-            ch1[idx] = (row[px3 + 1] - 127.0f) / 128.0f; // G
-            ch2[idx] = (row[px3 + 2] - 127.0f) / 128.0f; // R
-          }
-        }
-
-        try {
-          auto ufResults =
-              faceSession->Run(runOpts, &ufInputName, &ufInputTensor, 1,
-                               ufOutputNames.data(), ufOutputNames.size());
-
-          const float *scores = ufResults[0].GetTensorData<float>();
-          const float *boxes = ufResults[1].GetTensorData<float>();
-          int numAnchors = static_cast<int>(ufPriors.size());
-
-          float bestConf = 0.7f;
-          int bestIdx = -1;
-          for (int a = 0; a < numAnchors; ++a) {
-            float conf = scores[a * 2 + 1]; // [bg, face]
-            if (conf > bestConf) {
-              bestConf = conf;
-              bestIdx = a;
-            }
-          }
-
-          if (bestIdx >= 0) {
-            const float CENTER_VAR = 0.1f;
-            const float SIZE_VAR = 0.2f;
-            float pcx = ufPriors[bestIdx][0];
-            float pcy = ufPriors[bestIdx][1];
-            float pw = ufPriors[bestIdx][2];
-            float ph = ufPriors[bestIdx][3];
-
-            float cx = pcx + boxes[bestIdx * 4 + 0] * CENTER_VAR * pw;
-            float cy = pcy + boxes[bestIdx * 4 + 1] * CENTER_VAR * ph;
-            float bw = pw * std::exp(boxes[bestIdx * 4 + 2] * SIZE_VAR);
-            float bh = ph * std::exp(boxes[bestIdx * 4 + 3] * SIZE_VAR);
-
-            float bx1 = cx - bw / 2.0f;
-            float by1 = cy - bh / 2.0f;
-            float bx2 = cx + bw / 2.0f;
-            float by2 = cy + bh / 2.0f;
-
-            int x1 = static_cast<int>(bx1 * frame.cols);
-            int y1 = static_cast<int>(by1 * frame.rows);
-            int x2 = static_cast<int>(bx2 * frame.cols);
-            int y2 = static_cast<int>(by2 * frame.rows);
-
-            int w = x2 - x1, h = y2 - y1;
-            if (w > 10 && h > 10) {
-              int padW = w / 10, padH = h / 10;
-              x1 = std::max(0, x1 - padW);
-              y1 = std::max(0, y1 - padH);
-              x2 = std::min(frame.cols, x2 + padW);
-              y2 = std::min(frame.rows, y2 + padH);
-              roi = cv::Rect(x1, y1, x2 - x1, y2 - y1);
-              faceFound = true;
-            }
-          }
-        } catch (const Ort::Exception &e) {
-          std::cerr << "[FACE] Error UltraFace: " << e.what() << std::endl;
-        }
-      }
-
-      if (faceFound) {
-        cv::rectangle(frame, roi, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
-
-        // [PASO 2] Recortar cara y preprocesar para PFLD
-        cv::Mat faceCrop = frame(roi);
-        preprocessFrame(faceCrop, resized, tensorData.data());
-
-        // [PASO 3] Inferencia ONNX (PFLD: 98 landmarks)
-        if (modelLoaded && session) {
-          try {
-            auto results = session->Run(runOpts, &cachedInputName, &inputTensor,
-                                        1, &cachedOutputName, 1);
-
-            const float *landmarks = results[0].GetTensorData<float>();
-
-            for (int p = 0; p < 98; ++p) {
-              float pfld_x = landmarks[p * 2];
-              float pfld_y = landmarks[p * 2 + 1];
-
-              int final_x = roi.x + static_cast<int>(pfld_x * roi.width);
-              int final_y = roi.y + static_cast<int>(pfld_y * roi.height);
-
-              bool isEyeOrPupil = (p >= 60 && p <= 75) || (p >= 96 && p <= 97);
-              cv::Scalar color =
-                  isEyeOrPupil ? cv::Scalar(0, 0, 255) : cv::Scalar(0, 255, 0);
-              int radius = isEyeOrPupil ? 3 : 2;
-
-              cv::circle(frame, cv::Point(final_x, final_y), radius, color, -1,
-                         cv::LINE_AA);
-            }
-
-          } catch (const Ort::Exception &e) {
-            std::cerr << "[ONNX] Error inferencia: " << e.what() << std::endl;
-          }
-        }
-      } else if (effectEnabled) {
-        cv::putText(frame, "ESTADO: BUSCANDO ROSTRO...", cv::Point(10, 40),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.9, cv::Scalar(0, 0, 255), 2,
-                    cv::LINE_AA);
-      }
+      // --- Pipeline de visión (Agnóstico, delegado) ---
+      processVisionPipeline(
+          frame, effectEnabled, faceDetectorOk, faceSession.get(), ufResized,
+          ufTensorData, ufInputName, ufInputTensor, ufOutputNames, ufPriors,
+          modelLoaded, session.get(), cachedInputName, inputTensor,
+          cachedOutputName, runOpts, tensorData, resized);
 
       auto end = std::chrono::high_resolution_clock::now();
       std::chrono::duration<double, std::milli> elapsed = end - start;
@@ -795,8 +818,6 @@ int main() {
                 << std::endl;
     }
 
-    const int UF_W = 320;
-    const int UF_H = 240;
     std::vector<float> ufTensorData(1 * 3 * UF_H * UF_W);
     std::array<int64_t, 4> ufShape = {1, 3, UF_H, UF_W};
     auto ufMemInfo =
@@ -934,125 +955,12 @@ int main() {
 
       auto start = std::chrono::high_resolution_clock::now();
 
-      // --- Pipeline de visión (solo si efecto habilitado) ---
-      cv::Rect roi;
-      bool faceFound = false;
-
-      if (effectEnabled && faceDetectorOk && faceSession) {
-        cv::resize(frame, ufResized, cv::Size(UF_W, UF_H));
-        const int ufPlane = UF_H * UF_W;
-        float *ch0 = ufTensorData.data();
-        float *ch1 = ch0 + ufPlane;
-        float *ch2 = ch1 + ufPlane;
-
-        for (int y = 0; y < UF_H; ++y) {
-          const uint8_t *row = ufResized.ptr<uint8_t>(y);
-          for (int x = 0; x < UF_W; ++x) {
-            int idx = y * UF_W + x;
-            int px3 = x * 3;
-            ch0[idx] = (row[px3 + 0] - 127.0f) / 128.0f;
-            ch1[idx] = (row[px3 + 1] - 127.0f) / 128.0f;
-            ch2[idx] = (row[px3 + 2] - 127.0f) / 128.0f;
-          }
-        }
-
-        try {
-          auto ufResults =
-              faceSession->Run(runOpts, &ufInputName, &ufInputTensor, 1,
-                               ufOutputNames.data(), ufOutputNames.size());
-
-          const float *scores = ufResults[0].GetTensorData<float>();
-          const float *boxes = ufResults[1].GetTensorData<float>();
-          int numAnchors = static_cast<int>(ufPriors.size());
-
-          float bestConf = 0.7f;
-          int bestIdx = -1;
-
-          for (int a = 0; a < numAnchors; ++a) {
-            float conf = scores[a * 2 + 1];
-            if (conf > bestConf) {
-              bestConf = conf;
-              bestIdx = a;
-            }
-          }
-
-          if (bestIdx >= 0) {
-            const float CENTER_VAR = 0.1f;
-            const float SIZE_VAR = 0.2f;
-            float pcx = ufPriors[bestIdx][0];
-            float pcy = ufPriors[bestIdx][1];
-            float pw = ufPriors[bestIdx][2];
-            float ph = ufPriors[bestIdx][3];
-
-            float cx = pcx + boxes[bestIdx * 4 + 0] * CENTER_VAR * pw;
-            float cy = pcy + boxes[bestIdx * 4 + 1] * CENTER_VAR * ph;
-            float bw = pw * std::exp(boxes[bestIdx * 4 + 2] * SIZE_VAR);
-            float bh = ph * std::exp(boxes[bestIdx * 4 + 3] * SIZE_VAR);
-
-            float bx1 = cx - bw / 2.0f;
-            float by1 = cy - bh / 2.0f;
-            float bx2 = cx + bw / 2.0f;
-            float by2 = cy + bh / 2.0f;
-
-            int x1 = static_cast<int>(bx1 * frame.cols);
-            int y1 = static_cast<int>(by1 * frame.rows);
-            int x2 = static_cast<int>(bx2 * frame.cols);
-            int y2 = static_cast<int>(by2 * frame.rows);
-
-            int w = x2 - x1, h = y2 - y1;
-            if (w > 10 && h > 10) {
-              int padW = w / 10, padH = h / 10;
-              x1 = std::max(0, x1 - padW);
-              y1 = std::max(0, y1 - padH);
-              x2 = std::min(frame.cols, x2 + padW);
-              y2 = std::min(frame.rows, y2 + padH);
-              roi = cv::Rect(x1, y1, x2 - x1, y2 - y1);
-              faceFound = true;
-            }
-          }
-        } catch (const Ort::Exception &e) {
-          std::cerr << "[FACE] Error UltraFace: " << e.what() << std::endl;
-        }
-      }
-
-      if (faceFound) {
-        cv::rectangle(frame, roi, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
-
-        cv::Mat faceCrop = frame(roi);
-        preprocessFrame(faceCrop, resized, tensorData.data());
-
-        if (modelLoaded && session) {
-          try {
-            auto results = session->Run(runOpts, &cachedInputName, &inputTensor,
-                                        1, &cachedOutputName, 1);
-
-            const float *landmarks = results[0].GetTensorData<float>();
-
-            for (int p = 0; p < 98; ++p) {
-              float pfld_x = landmarks[p * 2];
-              float pfld_y = landmarks[p * 2 + 1];
-
-              int final_x = roi.x + static_cast<int>(pfld_x * roi.width);
-              int final_y = roi.y + static_cast<int>(pfld_y * roi.height);
-
-              bool isEyeOrPupil = (p >= 60 && p <= 75) || (p >= 96 && p <= 97);
-              cv::Scalar color =
-                  isEyeOrPupil ? cv::Scalar(0, 0, 255) : cv::Scalar(0, 255, 0);
-              int radius = isEyeOrPupil ? 3 : 2;
-
-              cv::circle(frame, cv::Point(final_x, final_y), radius, color, -1,
-                         cv::LINE_AA);
-            }
-
-          } catch (const Ort::Exception &e) {
-            std::cerr << "[ONNX] Error inferencia: " << e.what() << std::endl;
-          }
-        }
-      } else if (effectEnabled) {
-        cv::putText(frame, "ESTADO: BUSCANDO ROSTRO...", cv::Point(10, 40),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.9, cv::Scalar(0, 0, 255), 2,
-                    cv::LINE_AA);
-      }
+      // --- Pipeline de visión (Agnóstico, delegado) ---
+      processVisionPipeline(
+          frame, effectEnabled, faceDetectorOk, faceSession.get(), ufResized,
+          ufTensorData, ufInputName, ufInputTensor, ufOutputNames, ufPriors,
+          modelLoaded, session.get(), cachedInputName, inputTensor,
+          cachedOutputName, runOpts, tensorData, resized);
 
       // Escritura a cámara virtual v4l2loopback
       write(fd, frame.data, frame.total() * frame.elemSize());
