@@ -1,8 +1,20 @@
+# Compilación y caché
 build/
 .cmake/
-models/onnxruntime*
-*.onnx
+.cache/
 *.bin.cache/
-build/
-.cache/clangd/index
 
+# Dependencias de ONNX Runtime
+models/onnxruntime*
+
+# Entornos virtuales Python
+venv/
+.venv/
+
+# Artefactos locales de calibración y transmutación
+rostro.mp4
+datos_calibracion/
+modelos_fp32/
+
+# Ignorar modelos compilados (generados localmente)
+*.onnx

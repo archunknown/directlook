@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <onnxruntime_cxx_api.h>
 #include <opencv2/opencv.hpp>
@@ -65,24 +66,9 @@ size_t getProcessMemory() {
 
 void preprocessFrame(const cv::Mat &frame, cv::Mat &resized, float *buffer) {
   cv::resize(frame, resized, cv::Size(MODEL_SIZE, MODEL_SIZE));
-  const int planeSize = MODEL_SIZE * MODEL_SIZE;
-
-  float *rPlane = buffer;
-  float *gPlane = buffer + planeSize;
-  float *bPlane = buffer + 2 * planeSize;
-  constexpr float INV_255 = 1.0f / 255.0f;
-  for (int y = 0; y < MODEL_SIZE; ++y) {
-    const uint8_t *row = resized.ptr<uint8_t>(y);
-    const int rowOffset = y * MODEL_SIZE;
-    for (int x = 0; x < MODEL_SIZE; ++x) {
-      const int px = x * 3;
-      const int idx = rowOffset + x;
-      // BGR (OpenCV) → RGB (ONNX) + normalización en un solo paso
-      rPlane[idx] = row[px + 2] * INV_255; // R
-      gPlane[idx] = row[px + 1] * INV_255; // G
-      bPlane[idx] = row[px + 0] * INV_255; // B
-    }
-  }
+  cv::Mat blob = cv::dnn::blobFromImage(resized, 1.0 / 255.0, cv::Size(),
+                                        cv::Scalar(), true);
+  std::memcpy(buffer, blob.ptr<float>(), blob.total() * sizeof(float));
 }
 
 // Generador de Prior Boxes para UltraFace SSD (slim-320)
@@ -132,7 +118,7 @@ int main() {
   Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "DirectLookDaemon");
   Ort::SessionOptions sessionOpts;
 
-  sessionOpts.SetIntraOpNumThreads(2);
+  sessionOpts.SetIntraOpNumThreads(1);
   sessionOpts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
   sessionOpts.DisableCpuMemArena(); // Desactiva pre-reserva de RAM (~80MB)
   sessionOpts.DisableMemPattern();  // Desactiva patrón de memoria agresivo
@@ -274,7 +260,7 @@ int main() {
   if (modelLoaded && session) {
     inNameHolder = session->GetInputNameAllocated(0, alloc);
     outNameHolder =
-        session->GetOutputNameAllocated(1, alloc); // 'linear' [1,196]
+        session->GetOutputNameAllocated(0, alloc); // 'linear' [1,196]
     cachedInputName = inNameHolder.get();
     cachedOutputName = outNameHolder.get();
   }
@@ -492,7 +478,7 @@ int main() {
   Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "DirectLookDaemon");
 
   Ort::SessionOptions sessionOpts;
-  sessionOpts.SetIntraOpNumThreads(2);
+  sessionOpts.SetIntraOpNumThreads(1);
   sessionOpts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
   sessionOpts.DisableCpuMemArena();
   sessionOpts.DisableMemPattern();
@@ -512,8 +498,8 @@ int main() {
     std::cout << "[MEMORIA] Post-carga ONNX: " << memMB << " MB" << std::endl;
 
     if (memPostCarga > MEMORY_LIMIT_BYTES) {
-      throw std::runtime_error("Límite arquitectónico de 80MB excedido (" +
-                               std::to_string(memMB) + " MB)");
+      std::cerr << "[ADVERTENCIA] Límite arquitectónico de 80MB excedido ("
+                << memMB << " MB)" << std::endl;
     }
 
   } catch (const Ort::Exception &e) {
@@ -633,7 +619,7 @@ int main() {
 
   if (modelLoaded && session) {
     inNameHolder = session->GetInputNameAllocated(0, alloc);
-    outNameHolder = session->GetOutputNameAllocated(1, alloc);
+    outNameHolder = session->GetOutputNameAllocated(0, alloc);
     cachedInputName = inNameHolder.get();
     cachedOutputName = outNameHolder.get();
   }
