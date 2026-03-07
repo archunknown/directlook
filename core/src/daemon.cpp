@@ -16,6 +16,7 @@
 #include <opencv2/opencv.hpp>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "protocol.h"
@@ -61,7 +62,7 @@ void signalHandler(int signum) {
 // =============================================================================
 // Constantes arquitectónicas
 // =============================================================================
-static constexpr size_t MEMORY_LIMIT_BYTES = 80 * 1024 * 1024; // 80 MB
+static constexpr size_t MEMORY_LIMIT_BYTES = 125 * 1024 * 1024; // 125 MB
 static const std::string MODEL_PATH = "modelos/pfld.onnx";
 static const std::string FACE_MODEL_PATH =
     "modelos/version-slim-320_simplified.onnx";
@@ -330,19 +331,31 @@ int main() {
   }
 
   // -----------------------------------------------------------------
-  // Canal IPC: Named Pipe (estrictamente no bloqueante)
+  // Canal IPC: Named Pipe (Overlapped I/O asíncrono nativo)
   // -----------------------------------------------------------------
-  HANDLE hPipe =
-      CreateNamedPipeA(DIRECTLOOK_PIPE_NAME, PIPE_ACCESS_DUPLEX,
-                       PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT,
-                       1, // instancias máximas
-                       1, // buffer salida (1 byte)
-                       1, // buffer entrada (1 byte)
-                       0, // timeout
-                       NULL);
+  HANDLE hPipe = CreateNamedPipeA(
+      DIRECTLOOK_PIPE_NAME, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+      PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+      1, // instancias máximas
+      1, // buffer salida (1 byte)
+      1, // buffer entrada (1 byte)
+      0, // timeout
+      NULL);
 
   bool pipeConnected = false;
+  bool readPending = false;
   bool effectEnabled = true;
+  uint8_t asyncCmdByte = 0;
+
+  OVERLAPPED olConnect;
+  std::memset(&olConnect, 0, sizeof(olConnect));
+  olConnect.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+  OVERLAPPED olRead;
+  std::memset(&olRead, 0, sizeof(olRead));
+  olRead.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+  bool connectPending = false;
 
   if (hPipe == INVALID_HANDLE_VALUE) {
     std::cerr << "[IPC] Error creando Named Pipe: " << GetLastError()
@@ -350,6 +363,15 @@ int main() {
   } else {
     std::cout << "[IPC] Named Pipe creado: " << DIRECTLOOK_PIPE_NAME
               << std::endl;
+    // Iniciar escucha asíncrona de conexión
+    ConnectNamedPipe(hPipe, &olConnect);
+    DWORD err = GetLastError();
+    if (err == ERROR_IO_PENDING) {
+      connectPending = true;
+    } else if (err == ERROR_PIPE_CONNECTED) {
+      pipeConnected = true;
+      std::cout << "[IPC] Cliente conectado." << std::endl;
+    }
   }
 
   // -----------------------------------------------------------------
@@ -358,41 +380,68 @@ int main() {
   std::cout << "[DAEMON] Servicio activo. Ctrl+C para detener." << std::endl;
 
   while (keepRunning.load()) {
-    cap.read(frame);
-    if (frame.empty()) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      continue;
-    }
-
-    auto start = std::chrono::high_resolution_clock::now();
-
-    // --- Sondeo IPC (cada iteración, no bloqueante) ---
+    // --- Sondeo IPC (ANTES de lectura de hardware) ---
     if (hPipe != INVALID_HANDLE_VALUE) {
-      if (!pipeConnected) {
-        ConnectNamedPipe(hPipe, NULL);
-        DWORD err = GetLastError();
-        if (err == ERROR_PIPE_CONNECTED || err == ERROR_NO_DATA) {
+      // Verificar conexión pendiente
+      if (!pipeConnected && connectPending) {
+        DWORD dummy;
+        if (GetOverlappedResult(hPipe, &olConnect, &dummy, FALSE)) {
           pipeConnected = true;
+          connectPending = false;
           std::cout << "[IPC] Cliente conectado." << std::endl;
         }
       }
 
       if (pipeConnected) {
-        uint8_t cmdByte;
-        DWORD bytesRead = 0;
-        if (ReadFile(hPipe, &cmdByte, 1, &bytesRead, NULL) && bytesRead == 1) {
-          processIpcCommand(cmdByte, effectEnabled);
-        } else {
-          DWORD err = GetLastError();
-          if (err != ERROR_NO_DATA) {
+        if (!readPending) {
+          // Iniciar lectura asíncrona de 1 byte
+          DWORD bytesRead = 0;
+          if (ReadFile(hPipe, &asyncCmdByte, 1, &bytesRead, &olRead)) {
+            // Completado sincrónicamente
+            processIpcCommand(asyncCmdByte, effectEnabled);
+          } else if (GetLastError() == ERROR_IO_PENDING) {
+            readPending = true;
+          } else {
+            // Cliente desconectado
             DisconnectNamedPipe(hPipe);
             pipeConnected = false;
+            readPending = false;
             std::cout << "[IPC] Cliente desconectado. Esperando reconexión..."
                       << std::endl;
+            ResetEvent(olConnect.hEvent);
+            ConnectNamedPipe(hPipe, &olConnect);
+            connectPending = (GetLastError() == ERROR_IO_PENDING);
+          }
+        } else {
+          // Sondear lectura pendiente (bWait=FALSE, zero-block)
+          DWORD bytesRead = 0;
+          if (GetOverlappedResult(hPipe, &olRead, &bytesRead, FALSE)) {
+            readPending = false;
+            if (bytesRead == 1) {
+              processIpcCommand(asyncCmdByte, effectEnabled);
+            }
+          } else if (GetLastError() != ERROR_IO_INCOMPLETE) {
+            // Error fatal de lectura → desconexión
+            DisconnectNamedPipe(hPipe);
+            pipeConnected = false;
+            readPending = false;
+            std::cout << "[IPC] Cliente desconectado. Esperando reconexión..."
+                      << std::endl;
+            ResetEvent(olConnect.hEvent);
+            ConnectNamedPipe(hPipe, &olConnect);
+            connectPending = (GetLastError() == ERROR_IO_PENDING);
           }
         }
       }
     }
+
+    cap.read(frame);
+    if (frame.empty()) {
+      std::this_thread::yield();
+      continue;
+    }
+
+    auto start = std::chrono::high_resolution_clock::now();
 
     // --- Pipeline de visión (solo si efecto habilitado) ---
     cv::Rect roi;
@@ -537,9 +586,15 @@ int main() {
   std::cout << "\n[DAEMON] Iniciando shutdown limpio..." << std::endl;
 
   if (hPipe != INVALID_HANDLE_VALUE) {
+    if (readPending)
+      CancelIo(hPipe);
     if (pipeConnected)
       DisconnectNamedPipe(hPipe);
     CloseHandle(hPipe);
+    if (olConnect.hEvent)
+      CloseHandle(olConnect.hEvent);
+    if (olRead.hEvent)
+      CloseHandle(olRead.hEvent);
     std::cout << "[IPC] Named Pipe cerrado." << std::endl;
   }
 
@@ -603,8 +658,8 @@ int main() {
     std::cout << "[MEMORIA] Post-carga ONNX: " << memMB << " MB" << std::endl;
 
     if (memPostCarga > MEMORY_LIMIT_BYTES) {
-      std::cerr << "[ADVERTENCIA] Límite arquitectónico de 80MB excedido ("
-                << memMB << " MB)" << std::endl;
+      throw std::runtime_error("Límite arquitectónico de 80MB excedido (" +
+                               std::to_string(memMB) + " MB)");
     }
 
   } catch (const Ort::Exception &e) {
@@ -771,21 +826,12 @@ int main() {
             << std::endl;
 
   while (keepRunning.load()) {
-    cap.read(frame);
-    if (frame.empty()) {
-      usleep(10000); // 10ms
-      continue;
-    }
-
-    auto start = std::chrono::high_resolution_clock::now();
-
-    // --- Sondeo IPC (cada iteración, no bloqueante) ---
+    // --- Sondeo IPC (ANTES de lectura de hardware) ---
     if (sockFd >= 0) {
       // Aceptar nuevo cliente (no bloqueante)
       if (clientFd < 0) {
         clientFd = accept(sockFd, NULL, NULL);
         if (clientFd >= 0) {
-          // Establecer no bloqueante en el socket del cliente
           int flags = fcntl(clientFd, F_GETFL, 0);
           fcntl(clientFd, F_SETFL, flags | O_NONBLOCK);
           std::cout << "[IPC] Cliente conectado." << std::endl;
@@ -799,15 +845,21 @@ int main() {
         if (n == 1) {
           processIpcCommand(cmdByte, effectEnabled);
         } else if (n == 0) {
-          // Cliente desconectado
           close(clientFd);
           clientFd = -1;
           std::cout << "[IPC] Cliente desconectado. Esperando reconexión..."
                     << std::endl;
         }
-        // n < 0 con EAGAIN/EWOULDBLOCK = sin datos, ignorar
       }
     }
+
+    cap.read(frame);
+    if (frame.empty()) {
+      std::this_thread::yield();
+      continue;
+    }
+
+    auto start = std::chrono::high_resolution_clock::now();
 
     // --- Pipeline de visión (solo si efecto habilitado) ---
     cv::Rect roi;
