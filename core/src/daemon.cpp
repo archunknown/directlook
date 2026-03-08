@@ -161,7 +161,13 @@ bool processIpcCommand(uint8_t byte, bool &effectEnabled) {
 // ARQUITECTURA WINDOWS (DirectShow / MSMF + Named Pipe IPC)
 // =====================================================================
 
-int main() {
+int main(int argc, char **argv) {
+  int cameraIndex = 0;
+  for (int i = 1; i < argc; ++i) {
+    if (std::string(argv[i]) == "--camera" && i + 1 < argc) {
+      cameraIndex = std::stoi(argv[++i]);
+    }
+  }
   // --- Registro de señales ---
   std::signal(SIGINT, signalHandler);
   std::signal(SIGTERM, signalHandler);
@@ -227,6 +233,8 @@ int main() {
       }
       emptyFrameCount = 0;
 
+      cv::resize(frame, frame, cv::Size(640, 360));
+
       auto start = std::chrono::high_resolution_clock::now();
 
       vision.process(frame, effectEnabled);
@@ -273,7 +281,13 @@ int main() {
 // ARQUITECTURA LINUX (v4l2loopback + Unix Domain Socket IPC)
 // =====================================================================
 
-int main() {
+int main(int argc, char **argv) {
+  int cameraIndex = 0;
+  for (int i = 1; i < argc; ++i) {
+    if (std::string(argv[i]) == "--camera" && i + 1 < argc) {
+      cameraIndex = std::stoi(argv[++i]);
+    }
+  }
   // --- Registro de señales ---
   std::signal(SIGINT, signalHandler);
   std::signal(SIGTERM, signalHandler);
@@ -307,10 +321,11 @@ int main() {
     // -----------------------------------------------------------------
     // Captura de video + inyección a sumidero configurado
     // -----------------------------------------------------------------
-    cap.open(0, cv::CAP_V4L2);
+    cap.open(cameraIndex, cv::CAP_V4L2);
     if (!cap.isOpened()) {
       throw std::runtime_error(
-          "Falla estructural: Imposible adquirir /dev/video0.");
+          "Falla estructural: Imposible adquirir /dev/video" +
+          std::to_string(cameraIndex) + ".");
     }
 
     cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
@@ -347,6 +362,8 @@ int main() {
         continue;
       }
       emptyFrameCount = 0;
+
+      cv::resize(frame, frame, cv::Size(640, 360));
 
       auto start = std::chrono::high_resolution_clock::now();
 
