@@ -37,7 +37,10 @@ VisionPipeline::VisionPipeline(const std::string &faceModelPath,
     ufInputNameStr = ufInNameAllocated.get();
     ufInputName = ufInputNameStr.c_str();
 
-    for (size_t i = 0; i < faceSession->GetOutputCount(); ++i) {
+    size_t outCount = faceSession->GetOutputCount();
+    ufOutNamesStr.reserve(outCount);
+    ufOutputNames.reserve(outCount);
+    for (size_t i = 0; i < outCount; ++i) {
       auto outNameAllocated = faceSession->GetOutputNameAllocated(i, ufAlloc);
       ufOutNamesStr.push_back(outNameAllocated.get());
       ufOutputNames.push_back(ufOutNamesStr.back().c_str());
