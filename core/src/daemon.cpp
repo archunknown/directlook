@@ -277,7 +277,7 @@ void processVisionPipeline(cv::Mat &frame, bool effectEnabled,
         }
       }
     } catch (const Ort::Exception &e) {
-      std::cerr << "[FACE] Error UltraFace: " << e.what() << std::endl;
+      // Silenciado por hotfix de I/O bloqueante
     }
   }
 
@@ -311,7 +311,7 @@ void processVisionPipeline(cv::Mat &frame, bool effectEnabled,
         }
 
       } catch (const Ort::Exception &e) {
-        std::cerr << "[ONNX] Error inferencia: " << e.what() << std::endl;
+        // Silenciado por hotfix de I/O bloqueante
       }
     }
   } else if (effectEnabled) {
@@ -575,6 +575,7 @@ int main() {
     // -----------------------------------------------------------------
     std::cout << "[DAEMON] Servicio activo. Ctrl+C para detener." << std::endl;
 
+    int emptyFrameCount = 0;
     while (keepRunning.load()) {
       // --- Sondeo IPC (ANTES de lectura de hardware) ---
       if (hPipe != INVALID_HANDLE_VALUE) {
@@ -584,7 +585,6 @@ int main() {
           if (GetOverlappedResult(hPipe, &olConnect, &dummy, FALSE)) {
             pipeConnected = true;
             connectPending = false;
-            std::cout << "[IPC] Cliente conectado." << std::endl;
           }
         }
 
@@ -602,8 +602,6 @@ int main() {
               DisconnectNamedPipe(hPipe);
               pipeConnected = false;
               readPending = false;
-              std::cout << "[IPC] Cliente desconectado. Esperando reconexión..."
-                        << std::endl;
               ResetEvent(olConnect.hEvent);
               ConnectNamedPipe(hPipe, &olConnect);
               connectPending = (GetLastError() == ERROR_IO_PENDING);
@@ -621,8 +619,6 @@ int main() {
               DisconnectNamedPipe(hPipe);
               pipeConnected = false;
               readPending = false;
-              std::cout << "[IPC] Cliente desconectado. Esperando reconexión..."
-                        << std::endl;
               ResetEvent(olConnect.hEvent);
               ConnectNamedPipe(hPipe, &olConnect);
               connectPending = (GetLastError() == ERROR_IO_PENDING);
@@ -633,9 +629,16 @@ int main() {
 
       cap.read(frame);
       if (frame.empty()) {
+        emptyFrameCount++;
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (emptyFrameCount >= 90) {
+          throw std::runtime_error(
+              "Falla cr\u00edtica: Hardware de video inoperante por 3 "
+              "segundos. Abortando proceso.");
+        }
         continue;
       }
+      emptyFrameCount = 0;
 
       auto start = std::chrono::high_resolution_clock::now();
 
@@ -650,17 +653,6 @@ int main() {
       std::chrono::duration<double, std::milli> elapsed = end - start;
       total_latency += elapsed.count();
       frames_processed++;
-
-      // Reporte periódico cada 300 frames
-      if (frames_processed % 300 == 0) {
-        std::cout << "[PIPELINE] Frames: " << frames_processed
-                  << " | Latencia promedio: "
-                  << (total_latency / frames_processed) << " ms"
-                  << " | RAM: " << (getProcessMemory() / (1024.0 * 1024.0))
-                  << " MB"
-                  << " | Efecto: " << (effectEnabled ? "ON" : "OFF")
-                  << std::endl;
-      }
     }
 
   } catch (const std::exception &e) {
@@ -919,6 +911,7 @@ int main() {
     std::cout << "[DAEMON] Servicio activo. kill -SIGINT <pid> para detener."
               << std::endl;
 
+    int emptyFrameCount = 0;
     while (keepRunning.load()) {
       // --- Sondeo IPC (ANTES de lectura de hardware) ---
       if (sockFd >= 0) {
@@ -928,7 +921,6 @@ int main() {
           if (clientFd >= 0) {
             int flags = fcntl(clientFd, F_GETFL, 0);
             fcntl(clientFd, F_SETFL, flags | O_NONBLOCK);
-            std::cout << "[IPC] Cliente conectado." << std::endl;
           }
         }
 
@@ -941,17 +933,22 @@ int main() {
           } else if (n == 0) {
             close(clientFd);
             clientFd = -1;
-            std::cout << "[IPC] Cliente desconectado. Esperando reconexión..."
-                      << std::endl;
           }
         }
       }
 
       cap.read(frame);
       if (frame.empty()) {
+        emptyFrameCount++;
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (emptyFrameCount >= 90) {
+          throw std::runtime_error(
+              "Falla cr\u00edtica: Hardware de video inoperante por 3 "
+              "segundos. Abortando proceso.");
+        }
         continue;
       }
+      emptyFrameCount = 0;
 
       auto start = std::chrono::high_resolution_clock::now();
 
@@ -969,17 +966,6 @@ int main() {
       std::chrono::duration<double, std::milli> elapsed = end - start;
       total_latency += elapsed.count();
       frames_processed++;
-
-      // Reporte periódico cada 300 frames
-      if (frames_processed % 300 == 0) {
-        std::cout << "[PIPELINE] Frames: " << frames_processed
-                  << " | Latencia promedio: "
-                  << (total_latency / frames_processed) << " ms"
-                  << " | RAM: " << (getProcessMemory() / (1024.0 * 1024.0))
-                  << " MB"
-                  << " | Efecto: " << (effectEnabled ? "ON" : "OFF")
-                  << std::endl;
-      }
     }
   } catch (const std::exception &e) {
     std::cerr << "Excepcion capturada: " << e.what() << std::endl;
