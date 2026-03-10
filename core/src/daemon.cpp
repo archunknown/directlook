@@ -163,9 +163,12 @@ bool processIpcCommand(uint8_t byte, bool &effectEnabled) {
 
 int main(int argc, char **argv) {
   int cameraIndex = 0;
+  int targetFps = 30;
   for (int i = 1; i < argc; ++i) {
     if (std::string(argv[i]) == "--camera" && i + 1 < argc) {
       cameraIndex = std::stoi(argv[++i]);
+    } else if (std::string(argv[i]) == "--limit-fps" && i + 1 < argc) {
+      targetFps = std::stoi(argv[++i]);
     }
   }
   // --- Registro de señales ---
@@ -197,13 +200,24 @@ int main(int argc, char **argv) {
               << (memInicio / (1024.0 * 1024.0)) << " MB" << std::endl;
 
     // -----------------------------------------------------------------
-    // Instanciación del Motor ONNX Runtime (CPU)
+    // Captura de video e Inicialización Asistida
     // -----------------------------------------------------------------
-    VisionPipeline vision(FACE_MODEL_PATH, MODEL_PATH);
+    cap.open(cameraIndex, cv::CAP_DSHOW);
+    if (!cap.isOpened()) {
+      std::cerr << "Falla estructural: Imposible adquirir cámara "
+                << cameraIndex << " en Windows." << std::endl;
+      return 1;
+    }
+    cap.set(cv::CAP_PROP_FPS, targetFps);
+    double actualFps = cap.get(cv::CAP_PROP_FPS);
+    if (actualFps <= 0)
+      actualFps = targetFps;
 
     // -----------------------------------------------------------------
-    // Captura de video
+    // Instanciación del Motor ONNX Runtime (CPU)
     // -----------------------------------------------------------------
+    VisionPipeline vision(FACE_MODEL_PATH, MODEL_PATH, actualFps);
+
     bool effectEnabled = true;
     uint8_t asyncCmdByte = 0;
 
@@ -232,6 +246,13 @@ int main(int argc, char **argv) {
         continue;
       }
       emptyFrameCount = 0;
+
+      auto now = std::chrono::high_resolution_clock::now();
+      std::chrono::duration<double> iterTime = now - lastFrameTime;
+      if (iterTime.count() < minFrameDelay) {
+        continue;
+      }
+      lastFrameTime = now;
 
       cv::resize(frame, frame, cv::Size(640, 360));
 
@@ -283,9 +304,16 @@ int main(int argc, char **argv) {
 
 int main(int argc, char **argv) {
   int cameraIndex = 0;
+  int targetFps = 30;
+  std::string targetSink = "/dev/video2";
+
   for (int i = 1; i < argc; ++i) {
     if (std::string(argv[i]) == "--camera" && i + 1 < argc) {
       cameraIndex = std::stoi(argv[++i]);
+    } else if (std::string(argv[i]) == "--limit-fps" && i + 1 < argc) {
+      targetFps = std::stoi(argv[++i]);
+    } else if (std::string(argv[i]) == "--sink" && i + 1 < argc) {
+      targetSink = argv[++i];
     }
   }
   // --- Registro de señales ---
@@ -302,7 +330,7 @@ int main(int argc, char **argv) {
   // Variables para limpieza garantizada
   std::unique_ptr<IpcServer> ipcServer = std::make_unique<UnixSocketServer>();
   std::unique_ptr<VideoSink> videoSink =
-      std::make_unique<LinuxV4l2Sink>("/dev/video2");
+      std::make_unique<LinuxV4l2Sink>(targetSink);
 
   cv::VideoCapture cap;
   size_t frames_processed = 0;
@@ -312,11 +340,6 @@ int main(int argc, char **argv) {
     size_t memInicio = getProcessMemory();
     std::cout << "[MEMORIA] Inicio del proceso: "
               << (memInicio / (1024.0 * 1024.0)) << " MB" << std::endl;
-
-    // -----------------------------------------------------------------
-    // Instanciación del Motor ONNX Runtime (CPU)
-    // -----------------------------------------------------------------
-    VisionPipeline vision(FACE_MODEL_PATH, MODEL_PATH);
 
     // -----------------------------------------------------------------
     // Captura de video + inyección a sumidero configurado
@@ -330,8 +353,17 @@ int main(int argc, char **argv) {
 
     cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
     cap.set(cv::CAP_PROP_FRAME_HEIGHT, 360);
-    cap.set(cv::CAP_PROP_FPS, 15);
+    cap.set(cv::CAP_PROP_FPS, targetFps);
     cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+
+    double actualFps = cap.get(cv::CAP_PROP_FPS);
+    if (actualFps <= 0)
+      actualFps = targetFps;
+
+    // -----------------------------------------------------------------
+    // Instanciación del Motor ONNX Runtime (CPU)
+    // -----------------------------------------------------------------
+    VisionPipeline vision(FACE_MODEL_PATH, MODEL_PATH, actualFps);
 
     bool effectEnabled = true;
 
@@ -343,6 +375,8 @@ int main(int argc, char **argv) {
 
     cv::Mat frame;
     int emptyFrameCount = 0;
+    auto lastFrameTime = std::chrono::high_resolution_clock::now();
+    double minFrameDelay = 1.0 / targetFps;
     while (keepRunning.load()) {
       // --- Sondeo IPC (ANTES de lectura de hardware) ---
       uint8_t cmdByte;
@@ -362,6 +396,13 @@ int main(int argc, char **argv) {
         continue;
       }
       emptyFrameCount = 0;
+
+      auto now = std::chrono::high_resolution_clock::now();
+      std::chrono::duration<double> iterTime = now - lastFrameTime;
+      if (iterTime.count() < minFrameDelay) {
+        continue;
+      }
+      lastFrameTime = now;
 
       cv::resize(frame, frame, cv::Size(640, 360));
 
