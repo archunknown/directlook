@@ -7,8 +7,8 @@
 
 class VisionPipeline {
 public:
-  VisionPipeline(const std::string &faceModelPath,
-                 const std::string &modelPath);
+  VisionPipeline(const std::string &faceModelPath, const std::string &modelPath,
+                 double fps = 30.0);
   void process(cv::Mat &frame, bool effectEnabled);
 
 private:
@@ -53,4 +53,11 @@ private:
   cv::Mat resized;
   cv::Mat ufResized;
   cv::Mat blobBuffer;
+
+  // State Flags
+  bool isBlinking{false};
+  bool headOutOfBounds{false};
+  float warpMultiplier{0.0f};
+  int frameCounter{0};
+  float temporalStep{0.0f};
 };

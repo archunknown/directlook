@@ -1,10 +1,14 @@
 #include "vision_pipeline.h"
+#include <cmath>
 #include <iostream>
 
 VisionPipeline::VisionPipeline(const std::string &faceModelPath,
-                               const std::string &modelPath)
+                               const std::string &modelPath, double fps)
     : env(ORT_LOGGING_LEVEL_WARNING, "DirectLookDaemon"),
       ufTensorData(UF_ELEMENTS), tensorData(TENSOR_ELEMENTS) {
+
+  temporalStep =
+      static_cast<float>(1.0 / (fps * 0.1)); // Transición en 0.1 seg (100ms)
 
   sessionOpts.SetIntraOpNumThreads(1);
   sessionOpts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
@@ -217,6 +221,171 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled) {
                                     &cachedOutputName, 1);
 
         const float *landmarks = results[0].GetTensorData<float>();
+
+        // Cálculo de EAR (Eye Aspect Ratio) para detección de parpadeo
+        auto dist = [&](int p1, int p2) {
+          float dx = landmarks[p1 * 2] - landmarks[p2 * 2];
+          float dy = landmarks[p1 * 2 + 1] - landmarks[p2 * 2 + 1];
+          return std::sqrt(dx * dx + dy * dy);
+        };
+
+        float leftEAR = (dist(61, 67) + dist(62, 66) + dist(63, 65)) /
+                        (3.0f * dist(60, 64));
+        float rightEAR = (dist(69, 75) + dist(70, 74) + dist(71, 73)) /
+                         (3.0f * dist(68, 72));
+        float avgEAR = (leftEAR + rightEAR) / 2.0f;
+
+        const float BLINK_THRESHOLD = 0.2f;
+        isBlinking = (avgEAR < BLINK_THRESHOLD);
+
+        frameCounter++;
+
+        // Estimación de Pose Cefálica (Head Pose Estimation) - Frame Skipping
+        // c/4 frames
+        if (frameCounter % 4 == 0) {
+          std::vector<cv::Point2f> image_points;
+          auto get_pt = [&](int idx) {
+            return cv::Point2f(roi.x + landmarks[idx * 2] * roi.width,
+                               roi.y + landmarks[idx * 2 + 1] * roi.height);
+          };
+          // 54: Nariz, 16: Barbilla, 60: Esquina exterior ojo izq, 72: Esquina
+          // exterior ojo der, 76: Comisura boca izq, 82: Comisura boca der
+          image_points.push_back(get_pt(54));
+          image_points.push_back(get_pt(16));
+          image_points.push_back(get_pt(60));
+          image_points.push_back(get_pt(72));
+          image_points.push_back(get_pt(76));
+          image_points.push_back(get_pt(82));
+
+          std::vector<cv::Point3f> model_points;
+          model_points.push_back(cv::Point3f(0.0f, 0.0f, 0.0f)); // Nariz
+          model_points.push_back(
+              cv::Point3f(0.0f, -330.0f, -65.0f)); // Barbilla
+          model_points.push_back(
+              cv::Point3f(-225.0f, 170.0f, -135.0f)); // Ojo izq ext
+          model_points.push_back(
+              cv::Point3f(225.0f, 170.0f, -135.0f)); // Ojo der ext
+          model_points.push_back(
+              cv::Point3f(-150.0f, -150.0f, -125.0f)); // Boca izq
+          model_points.push_back(
+              cv::Point3f(150.0f, -150.0f, -125.0f)); // Boca der
+
+          double focal_length = frame.cols;
+          cv::Point2d center = cv::Point2d(frame.cols / 2.0, frame.rows / 2.0);
+          cv::Mat camera_matrix =
+              (cv::Mat_<double>(3, 3) << focal_length, 0, center.x, 0,
+               focal_length, center.y, 0, 0, 1);
+          cv::Mat dist_coeffs =
+              cv::Mat::zeros(4, 1, cv::DataType<double>::type);
+
+          cv::Mat rotation_vector, translation_vector;
+          cv::solvePnP(model_points, image_points, camera_matrix, dist_coeffs,
+                       rotation_vector, translation_vector);
+
+          cv::Mat rotation_matrix;
+          cv::Rodrigues(rotation_vector, rotation_matrix);
+
+          cv::Mat mtxR, mtxQ, Qx, Qy, Qz;
+          cv::Vec3d eulerAngles =
+              cv::RQDecomp3x3(rotation_matrix, mtxR, mtxQ, Qx, Qy, Qz);
+
+          // Pitch = eulerAngles[0], Yaw = eulerAngles[1], Roll = eulerAngles[2]
+          headOutOfBounds = (std::abs(eulerAngles[0]) > 15.0 ||
+                             std::abs(eulerAngles[1]) > 15.0);
+        }
+        // Interpolación Temporal del Efecto (Fade-out/Fade-in)
+        bool shouldApplyEffect =
+            effectEnabled && !isBlinking && !headOutOfBounds;
+        if (shouldApplyEffect) {
+          warpMultiplier =
+              std::min(1.0f, warpMultiplier +
+                                 temporalStep); // Sube 0.0 a 1.0 iterativamente
+        } else {
+          warpMultiplier =
+              std::max(0.0f, warpMultiplier -
+                                 temporalStep); // Baja 1.0 a 0.0 iterativamente
+        }
+
+        if (warpMultiplier > 0.0f) {
+          // Extracción de sub-fragmentos oculares confinados y marginados
+          auto get_eye_roi = [&](int start_idx, int end_idx) {
+            int min_x = frame.cols, max_x = 0;
+            int min_y = frame.rows, max_y = 0;
+            for (int i = start_idx; i <= end_idx; ++i) {
+              int px = roi.x + static_cast<int>(landmarks[i * 2] * roi.width);
+              int py =
+                  roi.y + static_cast<int>(landmarks[i * 2 + 1] * roi.height);
+              if (px < min_x)
+                min_x = px;
+              if (px > max_x)
+                max_x = px;
+              if (py < min_y)
+                min_y = py;
+              if (py > max_y)
+                max_y = py;
+            }
+            int w = max_x - min_x;
+            int h = max_y - min_y;
+            int pad_x = static_cast<int>(w * 0.2f);
+            int pad_y = static_cast<int>(h * 0.2f);
+            min_x = std::max(0, min_x - pad_x);
+            min_y = std::max(0, min_y - pad_y);
+            max_x = std::min(frame.cols - 1, max_x + pad_x);
+            max_y = std::min(frame.rows - 1, max_y + pad_y);
+            return cv::Rect(min_x, min_y, std::max(1, max_x - min_x),
+                            std::max(1, max_y - min_y));
+          };
+
+          cv::Rect leftEyeRoi = get_eye_roi(60, 67);
+          cv::Rect rightEyeRoi = get_eye_roi(68, 75);
+
+          cv::Mat left_map_x(leftEyeRoi.size(), CV_32FC1);
+          cv::Mat left_map_y(leftEyeRoi.size(), CV_32FC1);
+          cv::Mat right_map_x(rightEyeRoi.size(), CV_32FC1);
+          cv::Mat right_map_y(rightEyeRoi.size(), CV_32FC1);
+
+          auto apply_spherical_warp = [&](cv::Rect eyeRoi, cv::Mat &map_x,
+                                          cv::Mat &map_y) {
+            float cx = eyeRoi.width / 2.0f;
+            float cy = eyeRoi.height / 2.0f;
+            float radius = std::min(cx, cy);
+            float max_shift = radius * 0.5f;
+
+            for (int y = 0; y < eyeRoi.height; ++y) {
+              float *ptr_x = map_x.ptr<float>(y);
+              float *ptr_y = map_y.ptr<float>(y);
+              for (int x = 0; x < eyeRoi.width; ++x) {
+                float dx = x - cx;
+                float dy = y - cy;
+                float dist = std::sqrt(dx * dx + dy * dy);
+
+                float shift = 0.0f;
+                // Deformación Gaussiana/Parabólica confinada al radio espacial
+                if (dist < radius) {
+                  float curve = 1.0f - (dist * dist) / (radius * radius);
+                  shift = max_shift * curve;
+                }
+
+                ptr_x[x] = static_cast<float>(x);
+                ptr_y[y] =
+                    static_cast<float>(y) -
+                    shift; // Resta explícita para el desplazamiento vertical
+              }
+            }
+
+            cv::Mat warped_eye;
+            cv::Mat eye_crop = frame(eyeRoi);
+            cv::remap(eye_crop, warped_eye, map_x, map_y, cv::INTER_LINEAR);
+
+            // Alpha Blending con base en el multiplicador estricto temporal
+            cv::addWeighted(warped_eye, warpMultiplier, eye_crop,
+                            1.0f - warpMultiplier, 0.0, eye_crop);
+          };
+
+          // Ejecución Secuencial Independiente
+          apply_spherical_warp(leftEyeRoi, left_map_x, left_map_y);
+          apply_spherical_warp(rightEyeRoi, right_map_x, right_map_y);
+        }
 
         for (int p = 0; p < 98; ++p) {
           float pfld_x = landmarks[p * 2];
