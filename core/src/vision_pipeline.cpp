@@ -130,6 +130,8 @@ VisionPipeline::generateUltraFacePriors(int imgW, int imgH) {
 
 void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
                              int degradationLevel) {
+  if (degradationLevel >= 3) return;
+
   cv::Rect roi;
   bool faceFound = false;
 

@@ -14,6 +14,14 @@ CpuMonitor::CpuMonitor() {
   // Inicialización de la primera lectura base
   getCpuUsage();
   workerThread = std::thread(&CpuMonitor::monitorLoop, this);
+  
+#ifdef _WIN32
+  SetThreadPriority(workerThread.native_handle(), THREAD_PRIORITY_LOWEST);
+#else
+  sched_param param;
+  param.sched_priority = 0;
+  pthread_setschedparam(workerThread.native_handle(), SCHED_IDLE, &param);
+#endif
 }
 
 CpuMonitor::~CpuMonitor() {

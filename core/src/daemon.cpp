@@ -231,8 +231,7 @@ int main(int argc, char **argv) {
     cv::Mat frame;
     int emptyFrameCount = 0;
     bool alarmSent = false;
-    auto lastFrameTime = std::chrono::high_resolution_clock::now();
-    double minFrameDelay = 1.0 / targetFps;
+
     while (keepRunning.load()) {
       // --- Sondeo IPC (ANTES de lectura de hardware) ---
       if (ipcServer->pollCommand(asyncCmdByte)) {
@@ -251,13 +250,6 @@ int main(int argc, char **argv) {
         continue;
       }
       emptyFrameCount = 0;
-
-      auto now = std::chrono::high_resolution_clock::now();
-      std::chrono::duration<double> iterTime = now - lastFrameTime;
-      if (iterTime.count() < minFrameDelay) {
-        continue;
-      }
-      lastFrameTime = now;
 
       cv::resize(frame, frame, cv::Size(640, 360));
 
@@ -391,8 +383,7 @@ int main(int argc, char **argv) {
     cv::Mat frame;
     int emptyFrameCount = 0;
     bool alarmSent = false;
-    auto lastFrameTime = std::chrono::high_resolution_clock::now();
-    double minFrameDelay = 1.0 / targetFps;
+    
     while (keepRunning.load()) {
       // --- Sondeo IPC (ANTES de lectura de hardware) ---
       uint8_t cmdByte;
@@ -412,13 +403,6 @@ int main(int argc, char **argv) {
         continue;
       }
       emptyFrameCount = 0;
-
-      auto now = std::chrono::high_resolution_clock::now();
-      std::chrono::duration<double> iterTime = now - lastFrameTime;
-      if (iterTime.count() < minFrameDelay) {
-        continue;
-      }
-      lastFrameTime = now;
 
       cv::resize(frame, frame, cv::Size(640, 360));
 
