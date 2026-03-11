@@ -32,8 +32,6 @@ private:
   std::atomic<int> degradationLevel{0};
   std::thread workerThread;
 
-  int level1Cycles{0};
-  int level2Cycles{0};
-  int level3Cycles{0};
+  int escalationCycles{0};
   int recoveryCycles{0};
 };

@@ -230,6 +230,7 @@ int main(int argc, char **argv) {
     CpuMonitor monitor;
     cv::Mat frame;
     int emptyFrameCount = 0;
+    bool alarmSent = false;
     auto lastFrameTime = std::chrono::high_resolution_clock::now();
     double minFrameDelay = 1.0 / targetFps;
     while (keepRunning.load()) {
@@ -263,6 +264,14 @@ int main(int argc, char **argv) {
       auto start = std::chrono::high_resolution_clock::now();
 
       int level = monitor.getDegradationLevel();
+
+      if (level == 3 && !alarmSent) {
+        ipcServer->sendTelemetry(0x03);
+        alarmSent = true;
+      } else if (level < 3) {
+        alarmSent = false;
+      }
+
       vision.process(frame, effectEnabled, level);
 
       videoSink->writeFrame(frame);
@@ -381,6 +390,7 @@ int main(int argc, char **argv) {
     CpuMonitor monitor;
     cv::Mat frame;
     int emptyFrameCount = 0;
+    bool alarmSent = false;
     auto lastFrameTime = std::chrono::high_resolution_clock::now();
     double minFrameDelay = 1.0 / targetFps;
     while (keepRunning.load()) {
@@ -415,6 +425,14 @@ int main(int argc, char **argv) {
       auto start = std::chrono::high_resolution_clock::now();
 
       int level = monitor.getDegradationLevel();
+
+      if (level == 3 && !alarmSent) {
+        ipcServer->sendTelemetry(0x03);
+        alarmSent = true;
+      } else if (level < 3) {
+        alarmSent = false;
+      }
+
       vision.process(frame, effectEnabled, level);
 
       videoSink->writeFrame(frame);

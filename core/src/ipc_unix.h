@@ -10,6 +10,7 @@ public:
   ~UnixSocketServer() override;
 
   bool pollCommand(uint8_t &cmdByte) override;
+  void sendTelemetry(uint8_t code) override;
 
 private:
   int sockFd;

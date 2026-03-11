@@ -100,42 +100,27 @@ void CpuMonitor::monitorLoop() {
     
     double currentUsage = getCpuUsage();
 
-    if (currentUsage > 95.0) {
-      level3Cycles++;
-      level2Cycles = 0;
-      level1Cycles = 0;
+    if (currentUsage > 70.0) {
+      escalationCycles++;
       recoveryCycles = 0;
-      if (level3Cycles >= 10) {
-        degradationLevel.store(3);
-        level3Cycles = 10;
+      if (escalationCycles >= 10) {
+        int currentLevel = degradationLevel.load();
+        if (currentLevel < 3) {
+          degradationLevel.store(currentLevel + 1);
+        }
+        escalationCycles = 0; // Reset para los siguientes 5 segundos
       }
-    } else if (currentUsage > 85.0) {
-      level3Cycles = 0;
-      level2Cycles++;
-      level1Cycles = 0;
-      recoveryCycles = 0;
-      if (level2Cycles >= 10) {
-        degradationLevel.store(2);
-        level2Cycles = 10;
-      }
-    } else if (currentUsage > 70.0) {
-      level3Cycles = 0;
-      level2Cycles = 0;
-      level1Cycles++;
-      recoveryCycles = 0;
-      if (level1Cycles >= 10) {
-        degradationLevel.store(1);
-        level1Cycles = 10;
-      }
-    } else if (currentUsage < 60.0) {
-      level3Cycles = 0;
-      level2Cycles = 0;
-      level1Cycles = 0;
+    } else if (currentUsage < 50.0) {
       recoveryCycles++;
+      escalationCycles = 0;
       if (recoveryCycles >= 10) {
         degradationLevel.store(0);
-        recoveryCycles = 10;
+        recoveryCycles = 0;
       }
+    } else {
+      // Entre 50% y 70%, se mantiene el estado estable
+      escalationCycles = 0;
+      recoveryCycles = 0;
     }
   }
 }

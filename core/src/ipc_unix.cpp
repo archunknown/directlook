@@ -74,4 +74,10 @@ bool UnixSocketServer::pollCommand(uint8_t &cmdByte) {
   return false;
 }
 
+void UnixSocketServer::sendTelemetry(uint8_t code) {
+  if (sockFd < 0 || clientFd < 0) return;
+  // MSG_NOSIGNAL prevents SIGPIPE if client is disconnected during send
+  send(clientFd, &code, 1, MSG_DONTWAIT | MSG_NOSIGNAL);
+}
+
 #endif

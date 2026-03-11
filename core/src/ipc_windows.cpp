@@ -10,6 +10,7 @@ WindowsNamedPipeServer::WindowsNamedPipeServer()
       readPending(false) {
   std::memset(&olConnect, 0, sizeof(olConnect));
   std::memset(&olRead, 0, sizeof(olRead));
+  std::memset(&olWrite, 0, sizeof(olWrite));
 
   hPipe = CreateNamedPipeA(DIRECTLOOK_PIPE_NAME,
                            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
@@ -22,6 +23,7 @@ WindowsNamedPipeServer::WindowsNamedPipeServer()
 
   olConnect.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
   olRead.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+  olWrite.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
 
   if (hPipe == INVALID_HANDLE_VALUE) {
     throw std::runtime_error(
@@ -50,6 +52,8 @@ WindowsNamedPipeServer::~WindowsNamedPipeServer() {
       CloseHandle(olConnect.hEvent);
     if (olRead.hEvent)
       CloseHandle(olRead.hEvent);
+    if (olWrite.hEvent)
+      CloseHandle(olWrite.hEvent);
     std::cout << "[IPC] Named Pipe cerrado." << std::endl;
   }
 }
@@ -99,6 +103,12 @@ bool WindowsNamedPipeServer::pollCommand(uint8_t &cmdByte) {
     }
   }
   return false;
+}
+
+void WindowsNamedPipeServer::sendTelemetry(uint8_t code) {
+  if (hPipe == INVALID_HANDLE_VALUE || !pipeConnected) return;
+  DWORD bytesWritten = 0;
+  WriteFile(hPipe, &code, 1, &bytesWritten, &olWrite);
 }
 
 #endif
