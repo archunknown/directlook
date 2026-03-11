@@ -17,6 +17,7 @@
 #include <thread>
 #include <vector>
 
+#include "cpu_monitor.h"
 #include "ipc_server.h"
 #include "protocol.h"
 #include "vision_pipeline.h"
@@ -226,8 +227,11 @@ int main(int argc, char **argv) {
     // -----------------------------------------------------------------
     std::cout << "[DAEMON] Servicio activo. Ctrl+C para detener." << std::endl;
 
+    CpuMonitor monitor;
     cv::Mat frame;
     int emptyFrameCount = 0;
+    auto lastFrameTime = std::chrono::high_resolution_clock::now();
+    double minFrameDelay = 1.0 / targetFps;
     while (keepRunning.load()) {
       // --- Sondeo IPC (ANTES de lectura de hardware) ---
       if (ipcServer->pollCommand(asyncCmdByte)) {
@@ -258,7 +262,8 @@ int main(int argc, char **argv) {
 
       auto start = std::chrono::high_resolution_clock::now();
 
-      vision.process(frame, effectEnabled);
+      int level = monitor.getDegradationLevel();
+      vision.process(frame, effectEnabled, level);
 
       videoSink->writeFrame(frame);
 
@@ -373,6 +378,7 @@ int main(int argc, char **argv) {
     std::cout << "[DAEMON] Servicio activo. kill -SIGINT <pid> para detener."
               << std::endl;
 
+    CpuMonitor monitor;
     cv::Mat frame;
     int emptyFrameCount = 0;
     auto lastFrameTime = std::chrono::high_resolution_clock::now();
@@ -408,7 +414,8 @@ int main(int argc, char **argv) {
 
       auto start = std::chrono::high_resolution_clock::now();
 
-      vision.process(frame, effectEnabled);
+      int level = monitor.getDegradationLevel();
+      vision.process(frame, effectEnabled, level);
 
       videoSink->writeFrame(frame);
 
