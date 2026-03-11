@@ -3,6 +3,7 @@
 #ifdef _WIN32
 #include "protocol.h"
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 
 WindowsNamedPipeServer::WindowsNamedPipeServer()
@@ -59,6 +60,7 @@ WindowsNamedPipeServer::~WindowsNamedPipeServer() {
 }
 
 bool WindowsNamedPipeServer::pollCommand(uint8_t &cmdByte) {
+  std::lock_guard<std::mutex> lock(ipcMutex);
   if (hPipe == INVALID_HANDLE_VALUE)
     return false;
 
@@ -106,6 +108,7 @@ bool WindowsNamedPipeServer::pollCommand(uint8_t &cmdByte) {
 }
 
 void WindowsNamedPipeServer::sendTelemetry(uint8_t code) {
+  std::lock_guard<std::mutex> lock(ipcMutex);
   if (hPipe == INVALID_HANDLE_VALUE || !pipeConnected) return;
   DWORD bytesWritten = 0;
   WriteFile(hPipe, &code, 1, &bytesWritten, &olWrite);

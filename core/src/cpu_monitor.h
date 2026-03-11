@@ -17,15 +17,12 @@ private:
 #ifdef _WIN32
   // Helpers Windows para cálculos de tiempo
   unsigned long long fileTimeToULL(const void *ft) const;
-  unsigned long long lastIdleTime = 0;
-  unsigned long long lastKernelTime = 0;
-  unsigned long long lastUserTime = 0;
+  unsigned long long lastProcessTime = 0;
+  unsigned long long lastSystemTime = 0;
 #else
   // Helpers Linux para cálculos de tiempo
-  unsigned long long lastTotalUser = 0;
-  unsigned long long lastTotalUserLow = 0;
-  unsigned long long lastTotalSys = 0;
-  unsigned long long lastTotalIdle = 0;
+  unsigned long long lastProcTotal = 0;
+  unsigned long long lastSysTotal = 0;
 #endif
 
   std::atomic<bool> keepRunning{true};

@@ -135,7 +135,9 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
 
   if (effectEnabled && faceDetectorOk && faceSession) {
     bool runFaceDetection = true;
-    if (degradationLevel >= 1) {
+    if (degradationLevel >= 3) {
+      runFaceDetection = false;
+    } else if (degradationLevel >= 1) {
       if (ufSkipCounter++ % 4 != 0 && hasValidLastRoi) {
         runFaceDetection = false;
       }
@@ -256,8 +258,11 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
         const float *landmarks = currentLandmarks.data();
 
         if (isSkippedFrame) {
-          // Nivel 2: Extrapolación lineal / Momentum pre-proyectivo
-          const float MAX_DISPLACEMENT = 0.05f; // Clamping Físico Normalizado
+          if (degradationLevel >= 3) {
+            currentLandmarks = previousLandmarks;
+          } else {
+            // Nivel 2: Extrapolación lineal / Momentum pre-proyectivo
+            const float MAX_DISPLACEMENT = 0.05f; // Clamping Físico Normalizado
           for (int i = 0; i < 98; ++i) {
             float deltaX = currentLandmarks[i * 2] - previousLandmarks[i * 2];
             float deltaY = currentLandmarks[i * 2 + 1] - previousLandmarks[i * 2 + 1];
@@ -267,9 +272,9 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
               // Movimiento irracional detectado. Anular extrapolación (Mantiene current = anterior salto).
             } else {
               currentLandmarks[i * 2] = currentLandmarks[i * 2] + deltaX;
-              currentLandmarks[i * 2 + 1] = currentLandmarks[i * 2 + 1] + deltaY;
             }
           }
+        }
         } else if (degradationLevel < 3) {
           previousLandmarks = currentLandmarks;
 
@@ -361,10 +366,12 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
           headOutOfBounds = (std::abs(eulerAngles[0]) > 15.0 ||
                              std::abs(eulerAngles[1]) > 15.0);
         }
-        // Nivel 3: Bypass de capa visual
+        // Nivel 3: Bypass de capa visual y Apagado Inmediato Estético
         bool shouldApplyEffect = effectEnabled && !isBlinking &&
                                  !headOutOfBounds && (degradationLevel < 3);
-        if (shouldApplyEffect) {
+        if (degradationLevel >= 3) {
+          warpMultiplier = 0.0f;
+        } else if (shouldApplyEffect) {
           warpMultiplier =
               std::min(1.0f, warpMultiplier +
                                  temporalStep); // Sube 0.0 a 1.0 iterativamente

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 
 class IpcServer {
 public:
@@ -13,4 +14,7 @@ public:
   // Sends a telemetry byte to the connected client asynchronously.
   // Fails silently if no client is connected or buffer is full.
   virtual void sendTelemetry(uint8_t code) = 0;
+
+protected:
+  std::mutex ipcMutex;
 };

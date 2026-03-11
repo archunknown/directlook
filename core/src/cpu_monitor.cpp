@@ -45,34 +45,37 @@ unsigned long long CpuMonitor::fileTimeToULL(const void *ft) const {
 }
 #endif
 
-double CpuMonitor::getCpuUsage() {
 #ifdef _WIN32
-  FILETIME idleTime, kernelTime, userTime;
-  if (!GetSystemTimes(&idleTime, &kernelTime, &userTime)) {
+double CpuMonitor::getCpuUsage() {
+  FILETIME creationTime, exitTime, kernelTime, userTime;
+  FILETIME sysIdleTime, sysKernelTime, sysUserTime;
+
+  if (!GetProcessTimes(GetCurrentProcess(), &creationTime, &exitTime, &kernelTime, &userTime)) {
+    return 0.0;
+  }
+  if (!GetSystemTimes(&sysIdleTime, &sysKernelTime, &sysUserTime)) {
     return 0.0;
   }
 
-  unsigned long long currentIdleTime = fileTimeToULL(&idleTime);
-  unsigned long long currentKernelTime = fileTimeToULL(&kernelTime);
-  unsigned long long currentUserTime = fileTimeToULL(&userTime);
+  unsigned long long currentProcessTime = fileTimeToULL(&kernelTime) + fileTimeToULL(&userTime);
+  unsigned long long currentSystemTime = fileTimeToULL(&sysKernelTime) + fileTimeToULL(&sysUserTime);
 
-  unsigned long long idleDiff = currentIdleTime - lastIdleTime;
-  unsigned long long kernelDiff = currentKernelTime - lastKernelTime;
-  unsigned long long userDiff = currentUserTime - lastUserTime;
-
-  unsigned long long systemDiff = kernelDiff + userDiff;
-  
   double cpu = 0.0;
-  if (systemDiff > 0) {
-    cpu = (systemDiff - idleDiff) * 100.0 / systemDiff;
+  if (lastSystemTime > 0 || lastProcessTime > 0) {
+    unsigned long long processDiff = currentProcessTime - lastProcessTime;
+    unsigned long long systemDiff = currentSystemTime - lastSystemTime;
+    if (systemDiff > 0) {
+      cpu = (processDiff * 100.0) / systemDiff;
+    }
   }
 
-  lastIdleTime = currentIdleTime;
-  lastKernelTime = currentKernelTime;
-  lastUserTime = currentUserTime;
+  lastProcessTime = currentProcessTime;
+  lastSystemTime = currentSystemTime;
 
   return cpu;
+}
 #else
+double CpuMonitor::getCpuUsage() {
   std::ifstream statFile("/proc/stat");
   if (!statFile.is_open()) return 0.0;
   
@@ -86,21 +89,41 @@ double CpuMonitor::getCpuUsage() {
 
   unsigned long long user, nice, sys, idle;
   iss >> user >> nice >> sys >> idle;
+  unsigned long long currentSysTotal = user + nice + sys + idle;
+
+  std::ifstream procFile("/proc/self/stat");
+  if (!procFile.is_open()) return 0.0;
+  
+  std::string procLine;
+  std::getline(procFile, procLine);
+  procFile.close();
+
+  std::istringstream procIss(procLine);
+  std::string token;
+  unsigned long long utime = 0, stime = 0;
+  for (int i = 1; i <= 15; ++i) {
+    procIss >> token;
+    if (i == 14) utime = std::stoull(token);
+    if (i == 15) stime = std::stoull(token);
+  }
+  unsigned long long currentProcTotal = utime + stime;
 
   double percent = 0.0;
-  if (lastTotalUser > 0 || lastTotalUserLow > 0 || lastTotalSys > 0 || lastTotalIdle > 0) {
-    unsigned long long total = (user - lastTotalUser) + (nice - lastTotalUserLow) + (sys - lastTotalSys);
-    percent = total * 100.0 / (total + (idle - lastTotalIdle));
+  if (lastSysTotal > 0 || lastProcTotal > 0) {
+    unsigned long long procDiff = currentProcTotal - lastProcTotal;
+    unsigned long long sysDiff = currentSysTotal - lastSysTotal;
+    if (sysDiff > 0) {
+      percent = (procDiff * 100.0) / sysDiff;
+    }
   }
 
-  lastTotalUser = user;
-  lastTotalUserLow = nice;
-  lastTotalSys = sys;
-  lastTotalIdle = idle;
+  lastSysTotal = currentSysTotal;
+  lastProcTotal = currentProcTotal;
 
   return percent;
-#endif
+  return percent;
 }
+#endif
 
 void CpuMonitor::monitorLoop() {
   while (keepRunning.load()) {
@@ -118,10 +141,10 @@ void CpuMonitor::monitorLoop() {
         }
         escalationCycles = 0; // Reset para los siguientes 5 segundos
       }
-    } else if (currentUsage < 50.0) {
+    } else if (currentUsage < 20.0) {
       recoveryCycles++;
       escalationCycles = 0;
-      if (recoveryCycles >= 10) {
+      if (recoveryCycles >= 30) {
         int currentLevel = degradationLevel.load();
         if (currentLevel > 0) {
           degradationLevel.store(currentLevel - 1);
