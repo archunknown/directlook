@@ -5,6 +5,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -49,6 +50,7 @@ UnixSocketServer::~UnixSocketServer() {
 }
 
 bool UnixSocketServer::pollCommand(uint8_t &cmdByte) {
+  std::lock_guard<std::mutex> lock(ipcMutex);
   if (sockFd < 0)
     return false;
 
@@ -72,6 +74,13 @@ bool UnixSocketServer::pollCommand(uint8_t &cmdByte) {
   }
 
   return false;
+}
+
+void UnixSocketServer::sendTelemetry(uint8_t code) {
+  std::lock_guard<std::mutex> lock(ipcMutex);
+  if (sockFd < 0 || clientFd < 0) return;
+  // MSG_NOSIGNAL prevents SIGPIPE if client is disconnected during send
+  send(clientFd, &code, 1, MSG_DONTWAIT | MSG_NOSIGNAL);
 }
 
 #endif

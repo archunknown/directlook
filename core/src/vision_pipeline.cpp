@@ -5,7 +5,8 @@
 VisionPipeline::VisionPipeline(const std::string &faceModelPath,
                                const std::string &modelPath, double fps)
     : env(ORT_LOGGING_LEVEL_WARNING, "DirectLookDaemon"),
-      ufTensorData(UF_ELEMENTS), tensorData(TENSOR_ELEMENTS) {
+      ufTensorData(UF_ELEMENTS), tensorData(TENSOR_ELEMENTS),
+      previousLandmarks(98 * 2, 0.0f), currentLandmarks(98 * 2, 0.0f) {
 
   temporalStep =
       static_cast<float>(1.0 / (fps * 0.1)); // Transición en 0.1 seg (100ms)
@@ -127,85 +128,108 @@ VisionPipeline::generateUltraFacePriors(int imgW, int imgH) {
   return priors;
 }
 
-void VisionPipeline::process(cv::Mat &frame, bool effectEnabled) {
+void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
+                             int degradationLevel) {
   cv::Rect roi;
   bool faceFound = false;
 
   if (effectEnabled && faceDetectorOk && faceSession) {
-    cv::resize(frame, ufResized, cv::Size(UF_W, UF_H));
-    const int ufPlane = UF_H * UF_W;
-    float *ch0 = ufTensorData.data();
-    float *ch1 = ch0 + ufPlane;
-    float *ch2 = ch1 + ufPlane;
-
-    for (int y = 0; y < UF_H; ++y) {
-      const uint8_t *row = ufResized.ptr<uint8_t>(y);
-      for (int x = 0; x < UF_W; ++x) {
-        int idx = y * UF_W + x;
-        int px3 = x * 3;
-        ch0[idx] = (row[px3 + 0] - 127.0f) / 128.0f;
-        ch1[idx] = (row[px3 + 1] - 127.0f) / 128.0f;
-        ch2[idx] = (row[px3 + 2] - 127.0f) / 128.0f;
+    bool runFaceDetection = true;
+    if (degradationLevel >= 3) {
+      runFaceDetection = false;
+    } else if (degradationLevel >= 1) {
+      if (ufSkipCounter++ % 4 != 0 && hasValidLastRoi) {
+        runFaceDetection = false;
       }
+    } else {
+      ufSkipCounter = 0;
     }
 
-    try {
-      auto ufResults =
-          faceSession->Run(runOpts, &ufInputName, &ufInputTensor, 1,
-                           ufOutputNames.data(), ufOutputNames.size());
+    if (runFaceDetection) {
+      cv::resize(frame, ufResized, cv::Size(UF_W, UF_H));
+      const int ufPlane = UF_H * UF_W;
+      float *ch0 = ufTensorData.data();
+      float *ch1 = ch0 + ufPlane;
+      float *ch2 = ch1 + ufPlane;
 
-      const float *scores = ufResults[0].GetTensorData<float>();
-      const float *boxes = ufResults[1].GetTensorData<float>();
-      int numAnchors = static_cast<int>(ufPriors.size());
-
-      float bestConf = 0.7f;
-      int bestIdx = -1;
-
-      for (int a = 0; a < numAnchors; ++a) {
-        float conf = scores[a * 2 + 1];
-        if (conf > bestConf) {
-          bestConf = conf;
-          bestIdx = a;
+      for (int y = 0; y < UF_H; ++y) {
+        const uint8_t *row = ufResized.ptr<uint8_t>(y);
+        for (int x = 0; x < UF_W; ++x) {
+          int idx = y * UF_W + x;
+          int px3 = x * 3;
+          ch0[idx] = (row[px3 + 0] - 127.0f) / 128.0f;
+          ch1[idx] = (row[px3 + 1] - 127.0f) / 128.0f;
+          ch2[idx] = (row[px3 + 2] - 127.0f) / 128.0f;
         }
       }
 
-      if (bestIdx >= 0) {
-        const float CENTER_VAR = 0.1f;
-        const float SIZE_VAR = 0.2f;
-        float pcx = ufPriors[bestIdx][0];
-        float pcy = ufPriors[bestIdx][1];
-        float pw = ufPriors[bestIdx][2];
-        float ph = ufPriors[bestIdx][3];
+      try {
+        auto ufResults =
+            faceSession->Run(runOpts, &ufInputName, &ufInputTensor, 1,
+                             ufOutputNames.data(), ufOutputNames.size());
 
-        float cx = pcx + boxes[bestIdx * 4 + 0] * CENTER_VAR * pw;
-        float cy = pcy + boxes[bestIdx * 4 + 1] * CENTER_VAR * ph;
-        float bw = pw * std::exp(boxes[bestIdx * 4 + 2] * SIZE_VAR);
-        float bh = ph * std::exp(boxes[bestIdx * 4 + 3] * SIZE_VAR);
+        const float *scores = ufResults[0].GetTensorData<float>();
+        const float *boxes = ufResults[1].GetTensorData<float>();
+        int numAnchors = static_cast<int>(ufPriors.size());
 
-        float bx1 = cx - bw / 2.0f;
-        float by1 = cy - bh / 2.0f;
-        float bx2 = cx + bw / 2.0f;
-        float by2 = cy + bh / 2.0f;
+        float bestConf = 0.7f;
+        int bestIdx = -1;
 
-        int x1 = static_cast<int>(bx1 * frame.cols);
-        int y1 = static_cast<int>(by1 * frame.rows);
-        int x2 = static_cast<int>(bx2 * frame.cols);
-        int y2 = static_cast<int>(by2 * frame.rows);
-
-        int w = x2 - x1, h = y2 - y1;
-        if (w > 10 && h > 10) {
-          int padW = w / 10, padH = h / 10;
-          x1 = std::max(0, x1 - padW);
-          y1 = std::max(0, y1 - padH);
-          x2 = std::min(frame.cols, x2 + padW);
-          y2 = std::min(frame.rows, y2 + padH);
-          roi = cv::Rect(x1, y1, x2 - x1, y2 - y1);
-          faceFound = true;
+        for (int a = 0; a < numAnchors; ++a) {
+          float conf = scores[a * 2 + 1];
+          if (conf > bestConf) {
+            bestConf = conf;
+            bestIdx = a;
+          }
         }
+
+        if (bestIdx >= 0) {
+          const float CENTER_VAR = 0.1f;
+          const float SIZE_VAR = 0.2f;
+          float pcx = ufPriors[bestIdx][0];
+          float pcy = ufPriors[bestIdx][1];
+          float pw = ufPriors[bestIdx][2];
+          float ph = ufPriors[bestIdx][3];
+
+          float cx = pcx + boxes[bestIdx * 4 + 0] * CENTER_VAR * pw;
+          float cy = pcy + boxes[bestIdx * 4 + 1] * CENTER_VAR * ph;
+          float bw = pw * std::exp(boxes[bestIdx * 4 + 2] * SIZE_VAR);
+          float bh = ph * std::exp(boxes[bestIdx * 4 + 3] * SIZE_VAR);
+
+          float bx1 = cx - bw / 2.0f;
+          float by1 = cy - bh / 2.0f;
+          float bx2 = cx + bw / 2.0f;
+          float by2 = cy + bh / 2.0f;
+
+          int x1 = static_cast<int>(bx1 * frame.cols);
+          int y1 = static_cast<int>(by1 * frame.rows);
+          int x2 = static_cast<int>(bx2 * frame.cols);
+          int y2 = static_cast<int>(by2 * frame.rows);
+
+          int w = x2 - x1, h = y2 - y1;
+          if (w > 10 && h > 10) {
+            int padW = w / 10, padH = h / 10;
+            x1 = std::max(0, x1 - padW);
+            y1 = std::max(0, y1 - padH);
+            x2 = std::min(frame.cols, x2 + padW);
+            y2 = std::min(frame.rows, y2 + padH);
+            roi = cv::Rect(x1, y1, x2 - x1, y2 - y1);
+
+            // Cache para el Nivel 1 de QoS térmico
+            lastRoi = roi;
+            hasValidLastRoi = true;
+
+            faceFound = true;
+          }
+        }
+      } catch (const Ort::Exception &e) {
+        std::cerr << "[Inferencia UltraFace Error] " << e.what() << std::endl;
+        return;
       }
-    } catch (const Ort::Exception &e) {
-      std::cerr << "[Inferencia UltraFace Error] " << e.what() << std::endl;
-      return;
+    } else if (hasValidLastRoi) {
+      // Nivel 1: Evitamos el cálculo UltraFace y reusamos la caja anterior
+      roi = lastRoi;
+      faceFound = true;
     }
   }
 
@@ -213,14 +237,63 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled) {
     cv::rectangle(frame, roi, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
 
     cv::Mat faceCrop = frame(roi);
-    preprocessFrame(faceCrop, resized, blobBuffer, tensorData.data());
+
+    int currentSize = MODEL_SIZE; // Constant 112x112 for ONNX static shape
+    cv::resize(faceCrop, resized, cv::Size(currentSize, currentSize));
+    cv::dnn::blobFromImage(resized, blobBuffer, 1.0 / 255.0, cv::Size(),
+                           cv::Scalar(), true, false);
+    std::memcpy(tensorData.data(), blobBuffer.ptr<float>(),
+                blobBuffer.total() * sizeof(float));
 
     if (modelLoaded && session) {
       try {
-        auto results = session->Run(runOpts, &cachedInputName, &inputTensor, 1,
-                                    &cachedOutputName, 1);
+        if (degradationLevel >= 2 && degradationLevel < 3) {
+          isSkippedFrame = !isSkippedFrame;
+        } else if (degradationLevel >= 3) {
+          isSkippedFrame = true;
+        } else {
+          isSkippedFrame = false;
+        }
 
-        const float *landmarks = results[0].GetTensorData<float>();
+        const float *landmarks = currentLandmarks.data();
+
+        if (isSkippedFrame) {
+          if (degradationLevel >= 3) {
+            currentLandmarks = previousLandmarks;
+          } else {
+            // Nivel 2: Extrapolación lineal / Momentum pre-proyectivo
+            const float MAX_DISPLACEMENT = 0.05f; // Clamping Físico Normalizado
+          for (int i = 0; i < 98; ++i) {
+            float deltaX = currentLandmarks[i * 2] - previousLandmarks[i * 2];
+            float deltaY = currentLandmarks[i * 2 + 1] - previousLandmarks[i * 2 + 1];
+            
+            float mag = std::sqrt(deltaX * deltaX + deltaY * deltaY);
+            if (mag > MAX_DISPLACEMENT) {
+              // Movimiento irracional detectado. Anular extrapolación (Mantiene current = anterior salto).
+            } else {
+              currentLandmarks[i * 2] = currentLandmarks[i * 2] + deltaX;
+            }
+          }
+        }
+        } else if (degradationLevel < 3) {
+          previousLandmarks = currentLandmarks;
+
+          std::array<int64_t, 4> dynShape = {1, 3, currentSize, currentSize};
+          auto memInfo =
+              Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+          auto dynInput = Ort::Value::CreateTensor<float>(
+              memInfo, tensorData.data(),
+              dynShape[0] * dynShape[1] * dynShape[2] * dynShape[3],
+              dynShape.data(), dynShape.size());
+
+          auto results = session->Run(runOpts, &cachedInputName, &dynInput, 1,
+                                      &cachedOutputName, 1);
+
+          const float *outData = results[0].GetTensorData<float>();
+          for (int i = 0; i < 98 * 2; ++i) {
+            currentLandmarks[i] = outData[i];
+          }
+        }
 
         // Cálculo de EAR (Eye Aspect Ratio) para detección de parpadeo
         auto dist = [&](int p1, int p2) {
@@ -241,8 +314,8 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled) {
         frameCounter++;
 
         // Estimación de Pose Cefálica (Head Pose Estimation) - Frame Skipping
-        // c/4 frames
-        if (frameCounter % 4 == 0) {
+        // c/4 frames, solo calculable si la matriz landmark es real y no extrapolada
+        if (!isSkippedFrame && frameCounter % 4 == 0) {
           std::vector<cv::Point2f> image_points;
           auto get_pt = [&](int idx) {
             return cv::Point2f(roi.x + landmarks[idx * 2] * roi.width,
@@ -293,10 +366,12 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled) {
           headOutOfBounds = (std::abs(eulerAngles[0]) > 15.0 ||
                              std::abs(eulerAngles[1]) > 15.0);
         }
-        // Interpolación Temporal del Efecto (Fade-out/Fade-in)
-        bool shouldApplyEffect =
-            effectEnabled && !isBlinking && !headOutOfBounds;
-        if (shouldApplyEffect) {
+        // Nivel 3: Bypass de capa visual y Apagado Inmediato Estético
+        bool shouldApplyEffect = effectEnabled && !isBlinking &&
+                                 !headOutOfBounds && (degradationLevel < 3);
+        if (degradationLevel >= 3) {
+          warpMultiplier = 0.0f;
+        } else if (shouldApplyEffect) {
           warpMultiplier =
               std::min(1.0f, warpMultiplier +
                                  temporalStep); // Sube 0.0 a 1.0 iterativamente

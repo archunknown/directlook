@@ -21,11 +21,11 @@ else()
     set(SINK_SOURCES src/video_sink_unix.cpp)
 endif()
 
-add_executable(directlook-daemon src/daemon.cpp src/vision_pipeline.cpp ${IPC_SOURCES} ${SINK_SOURCES})
+add_executable(directlook-daemon src/daemon.cpp src/vision_pipeline.cpp src/cpu_monitor.cpp ${IPC_SOURCES} ${SINK_SOURCES})
 
 target_include_directories(directlook-daemon PRIVATE
     ${ONNXRUNTIME_INCLUDE_DIR}
-    ${CMAKE_SOURCE_DIR}/../ipc
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ipc
 )
 
 target_link_directories(directlook-daemon PRIVATE ${ONNXRUNTIME_LIB_DIR})

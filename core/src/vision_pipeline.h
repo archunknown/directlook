@@ -9,7 +9,7 @@ class VisionPipeline {
 public:
   VisionPipeline(const std::string &faceModelPath, const std::string &modelPath,
                  double fps = 30.0);
-  void process(cv::Mat &frame, bool effectEnabled);
+  void process(cv::Mat &frame, bool effectEnabled, int degradationLevel);
 
 private:
   void preprocessFrame(const cv::Mat &frame, cv::Mat &resized,
@@ -60,4 +60,14 @@ private:
   float warpMultiplier{0.0f};
   int frameCounter{0};
   float temporalStep{0.0f};
+
+  // State Machine for Thermal Degradation (Level 2 Momentum)
+  std::vector<float> previousLandmarks;
+  std::vector<float> currentLandmarks;
+  bool isSkippedFrame{false};
+
+  // State Machine for Thermal Degradation (Level 1 UltraFace Cache)
+  int ufSkipCounter{0};
+  cv::Rect lastRoi;
+  bool hasValidLastRoi{false};
 };

@@ -17,6 +17,7 @@
 #include <thread>
 #include <vector>
 
+#include "cpu_monitor.h"
 #include "ipc_server.h"
 #include "protocol.h"
 #include "vision_pipeline.h"
@@ -226,8 +227,25 @@ int main(int argc, char **argv) {
     // -----------------------------------------------------------------
     std::cout << "[DAEMON] Servicio activo. Ctrl+C para detener." << std::endl;
 
+    CpuMonitor monitor;
     cv::Mat frame;
     int emptyFrameCount = 0;
+
+    // --- Watchdog Telemetría IPC Asíncrona ---
+    std::thread ipcWatchdog([&monitor, &ipcServer]() {
+      bool alarmSent = false;
+      while (keepRunning.load()) {
+        int level = monitor.getDegradationLevel();
+        if (level == 3 && !alarmSent) {
+          ipcServer->sendTelemetry(DIRECTLOOK_CMD_THERMAL_ALARM);
+          alarmSent = true;
+        } else if (level < 3) {
+          alarmSent = false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      }
+    });
+
     while (keepRunning.load()) {
       // --- Sondeo IPC (ANTES de lectura de hardware) ---
       if (ipcServer->pollCommand(asyncCmdByte)) {
@@ -247,18 +265,13 @@ int main(int argc, char **argv) {
       }
       emptyFrameCount = 0;
 
-      auto now = std::chrono::high_resolution_clock::now();
-      std::chrono::duration<double> iterTime = now - lastFrameTime;
-      if (iterTime.count() < minFrameDelay) {
-        continue;
-      }
-      lastFrameTime = now;
-
       cv::resize(frame, frame, cv::Size(640, 360));
 
       auto start = std::chrono::high_resolution_clock::now();
 
-      vision.process(frame, effectEnabled);
+      int level = monitor.getDegradationLevel();
+
+      vision.process(frame, effectEnabled, level);
 
       videoSink->writeFrame(frame);
 
@@ -266,6 +279,11 @@ int main(int argc, char **argv) {
       std::chrono::duration<double, std::milli> elapsed = end - start;
       total_latency += elapsed.count();
       frames_processed++;
+    }
+
+    keepRunning.store(false);
+    if (ipcWatchdog.joinable()) {
+      ipcWatchdog.join();
     }
 
   } catch (const std::exception &e) {
@@ -373,10 +391,25 @@ int main(int argc, char **argv) {
     std::cout << "[DAEMON] Servicio activo. kill -SIGINT <pid> para detener."
               << std::endl;
 
+    CpuMonitor monitor;
     cv::Mat frame;
     int emptyFrameCount = 0;
-    auto lastFrameTime = std::chrono::high_resolution_clock::now();
-    double minFrameDelay = 1.0 / targetFps;
+
+    // --- Watchdog Telemetría IPC Asíncrona ---
+    std::thread ipcWatchdog([&monitor, &ipcServer]() {
+      bool alarmSent = false;
+      while (keepRunning.load()) {
+        int level = monitor.getDegradationLevel();
+        if (level == 3 && !alarmSent) {
+          ipcServer->sendTelemetry(DIRECTLOOK_CMD_THERMAL_ALARM);
+          alarmSent = true;
+        } else if (level < 3) {
+          alarmSent = false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      }
+    });
+    
     while (keepRunning.load()) {
       // --- Sondeo IPC (ANTES de lectura de hardware) ---
       uint8_t cmdByte;
@@ -397,18 +430,13 @@ int main(int argc, char **argv) {
       }
       emptyFrameCount = 0;
 
-      auto now = std::chrono::high_resolution_clock::now();
-      std::chrono::duration<double> iterTime = now - lastFrameTime;
-      if (iterTime.count() < minFrameDelay) {
-        continue;
-      }
-      lastFrameTime = now;
-
       cv::resize(frame, frame, cv::Size(640, 360));
 
       auto start = std::chrono::high_resolution_clock::now();
 
-      vision.process(frame, effectEnabled);
+      int level = monitor.getDegradationLevel();
+
+      vision.process(frame, effectEnabled, level);
 
       videoSink->writeFrame(frame);
 
@@ -416,6 +444,11 @@ int main(int argc, char **argv) {
       std::chrono::duration<double, std::milli> elapsed = end - start;
       total_latency += elapsed.count();
       frames_processed++;
+    }
+
+    keepRunning.store(false);
+    if (ipcWatchdog.joinable()) {
+      ipcWatchdog.join();
     }
   } catch (const std::exception &e) {
     std::cerr << "Excepcion capturada: " << e.what() << std::endl;
