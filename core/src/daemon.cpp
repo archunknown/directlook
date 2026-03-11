@@ -237,7 +237,7 @@ int main(int argc, char **argv) {
       while (keepRunning.load()) {
         int level = monitor.getDegradationLevel();
         if (level == 3 && !alarmSent) {
-          ipcServer->sendTelemetry(0x03);
+          ipcServer->sendTelemetry(DIRECTLOOK_CMD_THERMAL_ALARM);
           alarmSent = true;
         } else if (level < 3) {
           alarmSent = false;
@@ -401,7 +401,7 @@ int main(int argc, char **argv) {
       while (keepRunning.load()) {
         int level = monitor.getDegradationLevel();
         if (level == 3 && !alarmSent) {
-          ipcServer->sendTelemetry(0x03);
+          ipcServer->sendTelemetry(DIRECTLOOK_CMD_THERMAL_ALARM);
           alarmSent = true;
         } else if (level < 3) {
           alarmSent = false;

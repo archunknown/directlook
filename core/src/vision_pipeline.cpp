@@ -130,8 +130,6 @@ VisionPipeline::generateUltraFacePriors(int imgW, int imgH) {
 
 void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
                              int degradationLevel) {
-  if (degradationLevel >= 3) return;
-
   cv::Rect roi;
   bool faceFound = false;
 
@@ -247,8 +245,10 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
 
     if (modelLoaded && session) {
       try {
-        if (degradationLevel >= 2) {
+        if (degradationLevel >= 2 && degradationLevel < 3) {
           isSkippedFrame = !isSkippedFrame;
+        } else if (degradationLevel >= 3) {
+          isSkippedFrame = true;
         } else {
           isSkippedFrame = false;
         }
@@ -270,7 +270,7 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
               currentLandmarks[i * 2 + 1] = currentLandmarks[i * 2 + 1] + deltaY;
             }
           }
-        } else {
+        } else if (degradationLevel < 3) {
           previousLandmarks = currentLandmarks;
 
           std::array<int64_t, 4> dynShape = {1, 3, currentSize, currentSize};
@@ -309,8 +309,8 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
         frameCounter++;
 
         // Estimación de Pose Cefálica (Head Pose Estimation) - Frame Skipping
-        // c/4 frames
-        if (frameCounter % 4 == 0) {
+        // c/4 frames, solo calculable si la matriz landmark es real y no extrapolada
+        if (!isSkippedFrame && frameCounter % 4 == 0) {
           std::vector<cv::Point2f> image_points;
           auto get_pt = [&](int idx) {
             return cv::Point2f(roi.x + landmarks[idx * 2] * roi.width,
