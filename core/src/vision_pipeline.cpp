@@ -257,9 +257,18 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
 
         if (isSkippedFrame) {
           // Nivel 2: Extrapolación lineal / Momentum pre-proyectivo
-          for (int i = 0; i < 98 * 2; ++i) {
-            float delta = currentLandmarks[i] - previousLandmarks[i];
-            currentLandmarks[i] = currentLandmarks[i] + delta;
+          const float MAX_DISPLACEMENT = 0.05f; // Clamping Físico Normalizado
+          for (int i = 0; i < 98; ++i) {
+            float deltaX = currentLandmarks[i * 2] - previousLandmarks[i * 2];
+            float deltaY = currentLandmarks[i * 2 + 1] - previousLandmarks[i * 2 + 1];
+            
+            float mag = std::sqrt(deltaX * deltaX + deltaY * deltaY);
+            if (mag > MAX_DISPLACEMENT) {
+              // Movimiento irracional detectado. Anular extrapolación (Mantiene current = anterior salto).
+            } else {
+              currentLandmarks[i * 2] = currentLandmarks[i * 2] + deltaX;
+              currentLandmarks[i * 2 + 1] = currentLandmarks[i * 2 + 1] + deltaY;
+            }
           }
         } else {
           previousLandmarks = currentLandmarks;

@@ -122,7 +122,10 @@ void CpuMonitor::monitorLoop() {
       recoveryCycles++;
       escalationCycles = 0;
       if (recoveryCycles >= 10) {
-        degradationLevel.store(0);
+        int currentLevel = degradationLevel.load();
+        if (currentLevel > 0) {
+          degradationLevel.store(currentLevel - 1);
+        }
         recoveryCycles = 0;
       }
     } else {

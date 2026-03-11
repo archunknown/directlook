@@ -230,7 +230,21 @@ int main(int argc, char **argv) {
     CpuMonitor monitor;
     cv::Mat frame;
     int emptyFrameCount = 0;
-    bool alarmSent = false;
+
+    // --- Watchdog Telemetría IPC Asíncrona ---
+    std::thread ipcWatchdog([&monitor, &ipcServer]() {
+      bool alarmSent = false;
+      while (keepRunning.load()) {
+        int level = monitor.getDegradationLevel();
+        if (level == 3 && !alarmSent) {
+          ipcServer->sendTelemetry(0x03);
+          alarmSent = true;
+        } else if (level < 3) {
+          alarmSent = false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      }
+    });
 
     while (keepRunning.load()) {
       // --- Sondeo IPC (ANTES de lectura de hardware) ---
@@ -257,13 +271,6 @@ int main(int argc, char **argv) {
 
       int level = monitor.getDegradationLevel();
 
-      if (level == 3 && !alarmSent) {
-        ipcServer->sendTelemetry(0x03);
-        alarmSent = true;
-      } else if (level < 3) {
-        alarmSent = false;
-      }
-
       vision.process(frame, effectEnabled, level);
 
       videoSink->writeFrame(frame);
@@ -272,6 +279,11 @@ int main(int argc, char **argv) {
       std::chrono::duration<double, std::milli> elapsed = end - start;
       total_latency += elapsed.count();
       frames_processed++;
+    }
+
+    keepRunning.store(false);
+    if (ipcWatchdog.joinable()) {
+      ipcWatchdog.join();
     }
 
   } catch (const std::exception &e) {
@@ -382,7 +394,21 @@ int main(int argc, char **argv) {
     CpuMonitor monitor;
     cv::Mat frame;
     int emptyFrameCount = 0;
-    bool alarmSent = false;
+
+    // --- Watchdog Telemetría IPC Asíncrona ---
+    std::thread ipcWatchdog([&monitor, &ipcServer]() {
+      bool alarmSent = false;
+      while (keepRunning.load()) {
+        int level = monitor.getDegradationLevel();
+        if (level == 3 && !alarmSent) {
+          ipcServer->sendTelemetry(0x03);
+          alarmSent = true;
+        } else if (level < 3) {
+          alarmSent = false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      }
+    });
     
     while (keepRunning.load()) {
       // --- Sondeo IPC (ANTES de lectura de hardware) ---
@@ -410,13 +436,6 @@ int main(int argc, char **argv) {
 
       int level = monitor.getDegradationLevel();
 
-      if (level == 3 && !alarmSent) {
-        ipcServer->sendTelemetry(0x03);
-        alarmSent = true;
-      } else if (level < 3) {
-        alarmSent = false;
-      }
-
       vision.process(frame, effectEnabled, level);
 
       videoSink->writeFrame(frame);
@@ -425,6 +444,11 @@ int main(int argc, char **argv) {
       std::chrono::duration<double, std::milli> elapsed = end - start;
       total_latency += elapsed.count();
       frames_processed++;
+    }
+
+    keepRunning.store(false);
+    if (ipcWatchdog.joinable()) {
+      ipcWatchdog.join();
     }
   } catch (const std::exception &e) {
     std::cerr << "Excepcion capturada: " << e.what() << std::endl;
