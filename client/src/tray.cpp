@@ -18,19 +18,19 @@
 
 std::atomic<bool> is_running(true);
 std::atomic<bool> is_paused(false);
+HANDLE g_hPipe = INVALID_HANDLE_VALUE;
 HWND g_hwnd = NULL;
 NOTIFYICONDATA g_nid = {};
 
 // Hilo asíncrono para IPC
 static void ipc_worker() {
-  HANDLE hPipe;
   LPCSTR pipeName = "\\\\.\\pipe\\directlook_ipc";
 
   while (is_running) {
-    hPipe =
-        CreateFileA(pipeName, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
+    g_hPipe =
+        CreateFileA(pipeName, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
 
-    if (hPipe != INVALID_HANDLE_VALUE) {
+    if (g_hPipe != INVALID_HANDLE_VALUE) {
       std::cout << "DirectLook [Client Win]: Connected to daemon Named Pipe."
                 << std::endl;
       break;
@@ -50,8 +50,8 @@ static void ipc_worker() {
   uint8_t buffer;
   DWORD bytesRead;
 
-  while (is_running && hPipe != INVALID_HANDLE_VALUE) {
-    bool result = ReadFile(hPipe, &buffer, 1, &bytesRead, NULL);
+  while (is_running && g_hPipe != INVALID_HANDLE_VALUE) {
+    bool result = ReadFile(g_hPipe, &buffer, 1, &bytesRead, NULL);
 
     if (result && bytesRead > 0) {
       if (buffer == 0x03) {
@@ -68,8 +68,8 @@ static void ipc_worker() {
     }
   }
 
-  if (hPipe != INVALID_HANDLE_VALUE) {
-    CloseHandle(hPipe);
+  if (g_hPipe != INVALID_HANDLE_VALUE) {
+    CloseHandle(g_hPipe);
   }
 }
 
@@ -114,6 +114,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
     switch (LOWORD(wParam)) {
     case ID_TRAY_PAUSE:
       is_paused = !is_paused;
+      if (g_hPipe != INVALID_HANDLE_VALUE) {
+        DWORD bytesWritten;
+        uint8_t cmd = is_paused ? 0x01 : 0x00;
+        WriteFile(g_hPipe, &cmd, 1, &bytesWritten, NULL);
+      }
       std::cout << "DirectLook [Client Win]: Pause toggled to "
                 << (is_paused ? "true" : "false") << std::endl;
       break;
@@ -198,6 +203,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
 std::atomic<bool> is_running(true);
 std::atomic<bool> is_paused(false);
+int g_sock = -1;
 std::mutex state_mutex;
 
 static gboolean show_thermal_alarm_notification(gpointer data) {
@@ -223,8 +229,8 @@ static gboolean show_thermal_alarm_notification(gpointer data) {
 }
 
 static void ipc_worker() {
-  int sock = socket(AF_UNIX, SOCK_STREAM, 0);
-  if (sock == -1) {
+  g_sock = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (g_sock == -1) {
     std::cerr << "DirectLook [Client]: Failed to create IPC socket."
               << std::endl;
     return;
@@ -236,7 +242,7 @@ static void ipc_worker() {
   strncpy(addr.sun_path, "/tmp/directlook.sock", sizeof(addr.sun_path) - 1);
 
   while (is_running) {
-    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+    if (connect(g_sock, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
       std::cout << "DirectLook [Client]: Connected to daemon IPC." << std::endl;
       break;
     }
@@ -245,7 +251,7 @@ static void ipc_worker() {
 
   uint8_t buffer;
   while (is_running) {
-    ssize_t bytes_read = read(sock, &buffer, 1);
+    ssize_t bytes_read = read(g_sock, &buffer, 1);
     if (bytes_read > 0) {
       if (buffer == 0x03) {
         // Delegate notification rendering to the GTK main loop
@@ -261,12 +267,18 @@ static void ipc_worker() {
     }
   }
 
-  close(sock);
+  close(g_sock);
 }
 
 static void on_toggle_pause(GtkCheckMenuItem *item, gpointer data) {
   std::lock_guard<std::mutex> lock(state_mutex);
   is_paused = gtk_check_menu_item_get_active(item);
+
+  if (g_sock != -1) {
+    uint8_t cmd = is_paused ? 0x01 : 0x00;
+    send(g_sock, &cmd, 1, MSG_NOSIGNAL);
+  }
+
   std::cout << "DirectLook [Client]: Pause state toggled to "
             << (is_paused ? "true" : "false") << std::endl;
 }
