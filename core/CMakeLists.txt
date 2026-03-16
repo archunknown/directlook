@@ -31,6 +31,12 @@ target_include_directories(directlook-daemon PRIVATE
 target_link_directories(directlook-daemon PRIVATE ${ONNXRUNTIME_LIB_DIR})
 target_link_libraries(directlook-daemon PRIVATE ${OpenCV_LIBS} onnxruntime)
 
+# Roll mode: rotation (default) or attenuation (Plan B for high latency)
+option(DIRECTLOOK_ROLL_ATTENUATION "Use roll attenuation instead of map rotation" OFF)
+if(DIRECTLOOK_ROLL_ATTENUATION)
+  target_compile_definitions(directlook-daemon PRIVATE DIRECTLOOK_ROLL_MODE_ATTENUATION)
+endif()
+
 # Windows: linkear psapi.lib para GetProcessMemoryInfo
 if(WIN32)
     target_link_libraries(directlook-daemon PRIVATE psapi)
