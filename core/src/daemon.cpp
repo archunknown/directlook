@@ -246,6 +246,8 @@ int main(int argc, char **argv) {
       }
     });
 
+    auto lastFrameTime = std::chrono::high_resolution_clock::now();
+
     while (keepRunning.load()) {
       // --- Sondeo IPC (ANTES de lectura de hardware) ---
       if (ipcServer->pollCommand(asyncCmdByte)) {
@@ -267,11 +269,17 @@ int main(int argc, char **argv) {
 
       cv::resize(frame, frame, cv::Size(640, 360));
 
+      auto now = std::chrono::high_resolution_clock::now();
+      float dt = std::chrono::duration<float>(now - lastFrameTime).count();
+      if (dt <= 0.0f)
+        dt = 1.0f / 30.0f;
+      lastFrameTime = now;
+
       auto start = std::chrono::high_resolution_clock::now();
 
       int level = monitor.getDegradationLevel();
 
-      vision.process(frame, effectEnabled, level);
+      vision.process(frame, effectEnabled, level, dt);
 
       videoSink->writeFrame(frame);
 
@@ -409,7 +417,9 @@ int main(int argc, char **argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
       }
     });
-    
+
+    auto lastFrameTime = std::chrono::high_resolution_clock::now();
+
     while (keepRunning.load()) {
       // --- Sondeo IPC (ANTES de lectura de hardware) ---
       uint8_t cmdByte;
@@ -432,11 +442,17 @@ int main(int argc, char **argv) {
 
       cv::resize(frame, frame, cv::Size(640, 360));
 
+      auto now = std::chrono::high_resolution_clock::now();
+      float dt = std::chrono::duration<float>(now - lastFrameTime).count();
+      if (dt <= 0.0f)
+        dt = 1.0f / 30.0f;
+      lastFrameTime = now;
+
       auto start = std::chrono::high_resolution_clock::now();
 
       int level = monitor.getDegradationLevel();
 
-      vision.process(frame, effectEnabled, level);
+      vision.process(frame, effectEnabled, level, dt);
 
       videoSink->writeFrame(frame);
 
