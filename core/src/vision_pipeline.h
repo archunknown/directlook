@@ -1,15 +1,46 @@
 #pragma once
 #include <array>
+#include <cmath>
 #include <onnxruntime_cxx_api.h>
 #include <opencv2/opencv.hpp>
 #include <string>
 #include <vector>
 
+class OneEuroFilter {
+  float min_cutoff, beta, d_cutoff;
+  float x_prev, dx_prev;
+  bool initialized;
+  float alpha(float cutoff, float dt) {
+    float tau = 1.0f / (2.0f * 3.14159265f * cutoff);
+    return 1.0f / (1.0f + tau / dt);
+  }
+
+public:
+  OneEuroFilter(float mc = 1.0f, float b = 0.07f)
+      : min_cutoff(mc), beta(b), d_cutoff(1.0f), x_prev(0), dx_prev(0),
+        initialized(false) {}
+  float filter(float x, float dt) {
+    if (!initialized) {
+      x_prev = x;
+      initialized = true;
+      return x;
+    }
+    float dx = (x - x_prev) / dt;
+    float a_d = alpha(d_cutoff, dt);
+    dx_prev += a_d * (dx - dx_prev);
+    float cutoff = min_cutoff + beta * std::abs(dx_prev);
+    float a = alpha(cutoff, dt);
+    x_prev += a * (x - x_prev);
+    return x_prev;
+  }
+};
+
 class VisionPipeline {
 public:
   VisionPipeline(const std::string &faceModelPath, const std::string &modelPath,
                  double fps = 30.0);
-  void process(cv::Mat &frame, bool effectEnabled, int degradationLevel);
+  void process(cv::Mat &frame, bool effectEnabled, int degradationLevel,
+               float dt);
 
 private:
   void preprocessFrame(const cv::Mat &frame, cv::Mat &resized,
@@ -70,4 +101,30 @@ private:
   int ufSkipCounter{0};
   cv::Rect lastRoi;
   bool hasValidLastRoi{false};
+
+  // Edge-triggered logging state
+  bool prevFaceFound{false};
+  bool prevWarpFullyActive{false};
+  bool prevBlinking{false};
+
+  // EMA temporal filter state (per-eye shift persistence)
+  float last_shift_lx{0.0f};
+  float last_shift_ly{0.0f};
+  float last_shift_rx{0.0f};
+  float last_shift_ry{0.0f};
+
+  // Face detection hysteresis
+  int face_loss_buffer{0};
+
+  // OneEuroFilter for head pose angles
+  OneEuroFilter pitchFilter{1.0f, 0.07f};
+  OneEuroFilter yawFilter{1.0f, 0.07f};
+  OneEuroFilter rollFilter{1.0f, 0.07f};
+  float filteredPitch{0.0f};
+  float filteredYaw{0.0f};
+  float filteredRoll{0.0f};
+
+  // Asymmetric hysteresis state machine
+  bool effectActive{true};
+  int reentryCounter{0};
 };
