@@ -129,7 +129,7 @@ VisionPipeline::generateUltraFacePriors(int imgW, int imgH) {
 }
 
 void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
-                             int degradationLevel) {
+                             int degradationLevel, float dt) {
   cv::Rect roi;
   bool faceFound = false;
 
@@ -233,8 +233,19 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
     }
   }
 
+  // Histéresis de detección: buffer de 10 frames antes de declarar pérdida
   if (faceFound) {
-    cv::rectangle(frame, roi, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+    face_loss_buffer = 0;
+  } else if (hasValidLastRoi && face_loss_buffer < 10) {
+    face_loss_buffer++;
+    roi = lastRoi;
+    faceFound = true;
+  }
+
+  if (faceFound) {
+    if (!prevFaceFound) {
+      std::cout << "[DAEMON] Rostro enganchado\n";
+    }
 
     cv::Mat faceCrop = frame(roi);
 
@@ -263,18 +274,20 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
           } else {
             // Nivel 2: Extrapolación lineal / Momentum pre-proyectivo
             const float MAX_DISPLACEMENT = 0.05f; // Clamping Físico Normalizado
-          for (int i = 0; i < 98; ++i) {
-            float deltaX = currentLandmarks[i * 2] - previousLandmarks[i * 2];
-            float deltaY = currentLandmarks[i * 2 + 1] - previousLandmarks[i * 2 + 1];
-            
-            float mag = std::sqrt(deltaX * deltaX + deltaY * deltaY);
-            if (mag > MAX_DISPLACEMENT) {
-              // Movimiento irracional detectado. Anular extrapolación (Mantiene current = anterior salto).
-            } else {
-              currentLandmarks[i * 2] = currentLandmarks[i * 2] + deltaX;
+            for (int i = 0; i < 98; ++i) {
+              float deltaX = currentLandmarks[i * 2] - previousLandmarks[i * 2];
+              float deltaY =
+                  currentLandmarks[i * 2 + 1] - previousLandmarks[i * 2 + 1];
+
+              float mag = std::sqrt(deltaX * deltaX + deltaY * deltaY);
+              if (mag > MAX_DISPLACEMENT) {
+                // Movimiento irracional detectado. Anular extrapolación
+                // (Mantiene current = anterior salto).
+              } else {
+                currentLandmarks[i * 2] = currentLandmarks[i * 2] + deltaX;
+              }
             }
           }
-        }
         } else if (degradationLevel < 3) {
           previousLandmarks = currentLandmarks;
 
@@ -314,7 +327,8 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
         frameCounter++;
 
         // Estimación de Pose Cefálica (Head Pose Estimation) - Frame Skipping
-        // c/4 frames, solo calculable si la matriz landmark es real y no extrapolada
+        // c/4 frames, solo calculable si la matriz landmark es real y no
+        // extrapolada
         if (!isSkippedFrame && frameCounter % 4 == 0) {
           std::vector<cv::Point2f> image_points;
           auto get_pt = [&](int idx) {
@@ -362,23 +376,40 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
           cv::Vec3d eulerAngles =
               cv::RQDecomp3x3(rotation_matrix, mtxR, mtxQ, Qx, Qy, Qz);
 
-          // Pitch = eulerAngles[0], Yaw = eulerAngles[1], Roll = eulerAngles[2]
-          headOutOfBounds = (std::abs(eulerAngles[0]) > 15.0 ||
-                             std::abs(eulerAngles[1]) > 15.0);
+          // OneEuroFilter sobre Pitch, Yaw, Roll con dt real
+          filteredPitch =
+              pitchFilter.filter(static_cast<float>(eulerAngles[0]), dt);
+          filteredYaw =
+              yawFilter.filter(static_cast<float>(eulerAngles[1]), dt);
+          filteredRoll =
+              rollFilter.filter(static_cast<float>(eulerAngles[2]), dt);
+
+          // Histéresis asimétrica: desactivar a >20°, reactivar si <10° por 8
+          // frames
+          if (std::abs(filteredPitch) > 20.0f ||
+              std::abs(filteredYaw) > 20.0f) {
+            effectActive = false;
+            reentryCounter = 0;
+          } else if (!effectActive) {
+            if (std::abs(filteredPitch) < 10.0f &&
+                std::abs(filteredYaw) < 10.0f) {
+              if (++reentryCounter >= 8) {
+                effectActive = true;
+              }
+            } else {
+              reentryCounter = 0;
+            }
+          }
+          headOutOfBounds = !effectActive;
         }
-        // Nivel 3: Bypass de capa visual y Apagado Inmediato Estético
-        bool shouldApplyEffect = effectEnabled && !isBlinking &&
-                                 !headOutOfBounds && (degradationLevel < 3);
+        bool shouldApplyEffect = effectEnabled && !isBlinking && effectActive &&
+                                 (degradationLevel < 3);
         if (degradationLevel >= 3) {
           warpMultiplier = 0.0f;
         } else if (shouldApplyEffect) {
-          warpMultiplier =
-              std::min(1.0f, warpMultiplier +
-                                 temporalStep); // Sube 0.0 a 1.0 iterativamente
+          warpMultiplier = 1.0f; // Salto inmediato: autoridad total
         } else {
-          warpMultiplier =
-              std::max(0.0f, warpMultiplier -
-                                 temporalStep); // Baja 1.0 a 0.0 iterativamente
+          warpMultiplier = std::max(0.0f, warpMultiplier - temporalStep);
         }
 
         if (warpMultiplier > 0.0f) {
@@ -420,11 +451,26 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
           cv::Mat right_map_y(rightEyeRoi.size(), CV_32FC1);
 
           auto apply_spherical_warp = [&](cv::Rect eyeRoi, cv::Mat &map_x,
-                                          cv::Mat &map_y) {
+                                          cv::Mat &map_y, float raw_shift_x,
+                                          float raw_shift_y) {
             float cx = eyeRoi.width / 2.0f;
             float cy = eyeRoi.height / 2.0f;
-            float radius = std::min(cx, cy);
-            float max_shift = radius * 0.5f;
+            float radius = cx * 1.2f;
+
+            float mag = std::sqrt(raw_shift_x * raw_shift_x +
+                                  raw_shift_y * raw_shift_y);
+            float max_allowed = radius * 0.8f;
+
+            float shift_x = raw_shift_x;
+            float shift_y = raw_shift_y;
+            if (mag > max_allowed && mag > 0.0f) {
+              shift_x = (raw_shift_x / mag) * max_allowed;
+              shift_y = (raw_shift_y / mag) * max_allowed;
+            }
+
+            const float smoothCoef = 1.0f;
+            shift_x *= smoothCoef;
+            shift_y *= smoothCoef;
 
             for (int y = 0; y < eyeRoi.height; ++y) {
               float *ptr_x = map_x.ptr<float>(y);
@@ -434,49 +480,141 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
                 float dy = y - cy;
                 float dist = std::sqrt(dx * dx + dy * dy);
 
-                float shift = 0.0f;
-                // Deformación Gaussiana/Parabólica confinada al radio espacial
+                float curve_x = 0.0f;
+                float curve_y = 0.0f;
                 if (dist < radius) {
                   float curve = 1.0f - (dist * dist) / (radius * radius);
-                  shift = max_shift * curve;
+                  curve_x = shift_x * curve;
+                  curve_y = shift_y * curve;
                 }
 
-                ptr_x[x] = static_cast<float>(x);
-                ptr_y[y] =
-                    static_cast<float>(y) -
-                    shift; // Resta explícita para el desplazamiento vertical
+                ptr_x[x] = static_cast<float>(x) - curve_x;
+                ptr_y[y] = static_cast<float>(y) - curve_y;
               }
             }
 
-            cv::Mat warped_eye;
-            cv::Mat eye_crop = frame(eyeRoi);
-            cv::remap(eye_crop, warped_eye, map_x, map_y, cv::INTER_LINEAR);
+            // 1. Compensación de Roll (aislada)
+#ifndef DIRECTLOOK_ROLL_MODE_ATTENUATION
+            if (std::abs(filteredRoll) > 0.5f) {
+              cv::Point2f center(map_x.cols / 2.0f, map_x.rows / 2.0f);
+              cv::Mat rot = cv::getRotationMatrix2D(center, -filteredRoll, 1.0);
 
-            // Alpha Blending con base en el multiplicador estricto temporal
-            cv::addWeighted(warped_eye, warpMultiplier, eye_crop,
-                            1.0f - warpMultiplier, 0.0, eye_crop);
+              cv::Mat temp_x, temp_y;
+              cv::warpAffine(map_x, temp_x, rot, map_x.size(), cv::INTER_LINEAR,
+                             cv::BORDER_REPLICATE);
+              cv::warpAffine(map_y, temp_y, rot, map_y.size(), cv::INTER_LINEAR,
+                             cv::BORDER_REPLICATE);
+
+              map_x = temp_x;
+              map_y = temp_y;
+            }
+#else
+            // Plan B: Atenuación lineal del vector por Roll
+            float roll_atten =
+                std::max(0.0f, 1.0f - std::abs(filteredRoll) / 45.0f);
+            shift_x *= roll_atten;
+            shift_y *= roll_atten;
+#endif
+
+            // DEBUG: Vectores de corrección sobre el feed
+            std::string text = "ShiftX: " + std::to_string(shift_x) +
+                               " ShiftY: " + std::to_string(shift_y);
+            cv::putText(frame, text, cv::Point(10, 30),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0),
+                        2);
+            std::string text_rad = "Radio: " + std::to_string(radius) +
+                                   " Mult: " + std::to_string(warpMultiplier);
+            cv::putText(frame, text_rad, cv::Point(10, 60),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0),
+                        2);
+
+            // 2. Remapeo Esférico (Estrictamente out-of-place)
+            cv::Mat temp_roi;
+            cv::remap(frame(eyeRoi), temp_roi, map_x, map_y, cv::INTER_LINEAR,
+                      cv::BORDER_REPLICATE);
+
+            // 3. Aplicación visual con Alpha (warpMultiplier)
+            if (warpMultiplier >= 0.999f) {
+              temp_roi.copyTo(frame(eyeRoi));
+            } else {
+              cv::addWeighted(frame(eyeRoi), 1.0f - warpMultiplier, temp_roi,
+                              warpMultiplier, 0.0, frame(eyeRoi));
+            }
           };
 
-          // Ejecución Secuencial Independiente
-          apply_spherical_warp(leftEyeRoi, left_map_x, left_map_y);
-          apply_spherical_warp(rightEyeRoi, right_map_x, right_map_y);
+          // --- Ojo Izquierdo: EMA + Deadzone ---
+          float left_pupila_x_abs = roi.x + landmarks[97 * 2] * roi.width;
+          float left_pupila_y_abs = roi.y + landmarks[97 * 2 + 1] * roi.height;
+          float left_pupila_x_relativa =
+              left_pupila_x_abs - static_cast<float>(leftEyeRoi.x);
+          float left_pupila_y_relativa =
+              left_pupila_y_abs - static_cast<float>(leftEyeRoi.y);
+          float left_target_x = leftEyeRoi.width / 2.0f;
+          float left_target_y = leftEyeRoi.height / 2.0f;
+          float left_raw_shift_x = left_target_x - left_pupila_x_relativa;
+          float left_raw_shift_y = left_target_y - left_pupila_y_relativa;
+
+          constexpr float alpha = 0.5f;
+          float left_filtered_x =
+              (alpha * last_shift_lx) + ((1.0f - alpha) * left_raw_shift_x);
+          float left_filtered_y =
+              (alpha * last_shift_ly) + ((1.0f - alpha) * left_raw_shift_y);
+
+          float left_deadzone = 0.003f * static_cast<float>(leftEyeRoi.width);
+          float left_delta_x = std::abs(left_filtered_x - last_shift_lx);
+          float left_delta_y = std::abs(left_filtered_y - last_shift_ly);
+
+          if (left_delta_x > left_deadzone || left_delta_y > left_deadzone) {
+            last_shift_lx = left_filtered_x;
+            last_shift_ly = left_filtered_y;
+          }
+
+          apply_spherical_warp(leftEyeRoi, left_map_x, left_map_y,
+                               last_shift_lx, last_shift_ly);
+
+          // --- Ojo Derecho: EMA + Deadzone ---
+          float right_pupila_x_abs = roi.x + landmarks[96 * 2] * roi.width;
+          float right_pupila_y_abs = roi.y + landmarks[96 * 2 + 1] * roi.height;
+          float right_pupila_x_relativa =
+              right_pupila_x_abs - static_cast<float>(rightEyeRoi.x);
+          float right_pupila_y_relativa =
+              right_pupila_y_abs - static_cast<float>(rightEyeRoi.y);
+          float right_target_x = rightEyeRoi.width / 2.0f;
+          float right_target_y = rightEyeRoi.height / 2.0f;
+          float right_raw_shift_x = right_target_x - right_pupila_x_relativa;
+          float right_raw_shift_y = right_target_y - right_pupila_y_relativa;
+
+          float right_filtered_x =
+              (alpha * last_shift_rx) + ((1.0f - alpha) * right_raw_shift_x);
+          float right_filtered_y =
+              (alpha * last_shift_ry) + ((1.0f - alpha) * right_raw_shift_y);
+
+          float right_deadzone = 0.003f * static_cast<float>(rightEyeRoi.width);
+          float right_delta_x = std::abs(right_filtered_x - last_shift_rx);
+          float right_delta_y = std::abs(right_filtered_y - last_shift_ry);
+
+          if (right_delta_x > right_deadzone ||
+              right_delta_y > right_deadzone) {
+            last_shift_rx = right_filtered_x;
+            last_shift_ry = right_filtered_y;
+          }
+
+          apply_spherical_warp(rightEyeRoi, right_map_x, right_map_y,
+                               last_shift_rx, last_shift_ry);
         }
 
-        for (int p = 0; p < 98; ++p) {
-          float pfld_x = landmarks[p * 2];
-          float pfld_y = landmarks[p * 2 + 1];
-
-          int final_x = roi.x + static_cast<int>(pfld_x * roi.width);
-          int final_y = roi.y + static_cast<int>(pfld_y * roi.height);
-
-          bool isEyeOrPupil = (p >= 60 && p <= 75) || (p >= 96 && p <= 97);
-          cv::Scalar color =
-              isEyeOrPupil ? cv::Scalar(0, 0, 255) : cv::Scalar(0, 255, 0);
-          int radius = isEyeOrPupil ? 3 : 2;
-
-          cv::circle(frame, cv::Point(final_x, final_y), radius, color, -1,
-                     cv::LINE_AA);
+        // Edge-triggered logging: corrección activa
+        bool warpFullyActive = (warpMultiplier >= 1.0f);
+        if (warpFullyActive && !prevWarpFullyActive) {
+          std::cout << "[DAEMON] Corrección de mirada activa\n";
         }
+        prevWarpFullyActive = warpFullyActive;
+
+        // Edge-triggered logging: parpadeo
+        if (isBlinking && !prevBlinking) {
+          std::cout << "[DAEMON] Parpadeo detectado (Pausa temporal)\n";
+        }
+        prevBlinking = isBlinking;
 
       } catch (const Ort::Exception &e) {
         std::cerr << "[Inferencia PFLD Error] " << e.what() << std::endl;
@@ -484,8 +622,10 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
       }
     }
   } else if (effectEnabled) {
-    cv::putText(frame, "ESTADO: BUSCANDO ROSTRO...", cv::Point(10, 40),
-                cv::FONT_HERSHEY_SIMPLEX, 0.9, cv::Scalar(0, 0, 255), 2,
-                cv::LINE_AA);
+    if (prevFaceFound) {
+      std::cout << "[DAEMON] Rostro perdido\n";
+    }
   }
+
+  prevFaceFound = faceFound;
 }
