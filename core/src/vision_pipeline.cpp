@@ -347,15 +347,15 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
           std::vector<cv::Point3f> model_points;
           model_points.push_back(cv::Point3f(0.0f, 0.0f, 0.0f)); // Nariz
           model_points.push_back(
-              cv::Point3f(0.0f, -330.0f, -65.0f)); // Barbilla
+              cv::Point3f(0.0f, 330.0f, -65.0f)); // Barbilla (Y+)
           model_points.push_back(
-              cv::Point3f(-225.0f, 170.0f, -135.0f)); // Ojo izq ext
+              cv::Point3f(-225.0f, -170.0f, -135.0f)); // Ojo izq (Y-)
           model_points.push_back(
-              cv::Point3f(225.0f, 170.0f, -135.0f)); // Ojo der ext
+              cv::Point3f(225.0f, -170.0f, -135.0f)); // Ojo der (Y-)
           model_points.push_back(
-              cv::Point3f(-150.0f, -150.0f, -125.0f)); // Boca izq
+              cv::Point3f(-150.0f, 150.0f, -125.0f)); // Boca izq (Y+)
           model_points.push_back(
-              cv::Point3f(150.0f, -150.0f, -125.0f)); // Boca der
+              cv::Point3f(150.0f, 150.0f, -125.0f)); // Boca der (Y+)
 
           double focal_length = frame.cols;
           cv::Point2d center = cv::Point2d(frame.cols / 2.0, frame.rows / 2.0);
@@ -407,7 +407,7 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
         if (degradationLevel >= 3) {
           warpMultiplier = 0.0f;
         } else if (shouldApplyEffect) {
-          warpMultiplier = 1.0f; // Salto inmediato: autoridad total
+          warpMultiplier = 1.0f; // Salto inmediato: autoridad total restaurada
         } else {
           warpMultiplier = std::max(0.0f, warpMultiplier - temporalStep);
         }
@@ -442,35 +442,96 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
                             std::max(1, max_y - min_y));
           };
 
-          cv::Rect leftEyeRoi = get_eye_roi(60, 67);
-          cv::Rect rightEyeRoi = get_eye_roi(68, 75);
+          cv::Rect rawLeftEyeRoi = get_eye_roi(60, 67);
+          cv::Rect rawRightEyeRoi = get_eye_roi(68, 75);
+
+          auto apply_roi_filter = [&](cv::Rect raw, OneEuroFilter &fx,
+                                      OneEuroFilter &fy, OneEuroFilter &fw,
+                                      OneEuroFilter &fh) {
+            int x = static_cast<int>(fx.filter(static_cast<float>(raw.x), dt));
+            int y = static_cast<int>(fy.filter(static_cast<float>(raw.y), dt));
+            int w =
+                static_cast<int>(fw.filter(static_cast<float>(raw.width), dt));
+            int h =
+                static_cast<int>(fh.filter(static_cast<float>(raw.height), dt));
+
+            x = std::max(0, std::min(x, frame.cols - 1));
+            y = std::max(0, std::min(y, frame.rows - 1));
+            if (x + w > frame.cols)
+              w = frame.cols - x;
+            if (y + h > frame.rows)
+              h = frame.rows - y;
+            w = std::max(1, w);
+            h = std::max(1, h);
+
+            return cv::Rect(x, y, w, h);
+          };
+
+          cv::Rect leftEyeRoi =
+              apply_roi_filter(rawLeftEyeRoi, leftEyeXFilter, leftEyeYFilter,
+                               leftEyeWFilter, leftEyeHFilter);
+          cv::Rect rightEyeRoi =
+              apply_roi_filter(rawRightEyeRoi, rightEyeXFilter, rightEyeYFilter,
+                               rightEyeWFilter, rightEyeHFilter);
 
           cv::Mat left_map_x(leftEyeRoi.size(), CV_32FC1);
           cv::Mat left_map_y(leftEyeRoi.size(), CV_32FC1);
           cv::Mat right_map_x(rightEyeRoi.size(), CV_32FC1);
           cv::Mat right_map_y(rightEyeRoi.size(), CV_32FC1);
 
+          const bool FLIP_CORRECTION =
+              true; // Actívala o desactívala según el log
+
           auto apply_spherical_warp = [&](cv::Rect eyeRoi, cv::Mat &map_x,
                                           cv::Mat &map_y, float raw_shift_x,
-                                          float raw_shift_y) {
+                                          float raw_shift_y,
+                                          const std::string &sideName) {
             float cx = eyeRoi.width / 2.0f;
             float cy = eyeRoi.height / 2.0f;
-            float radius = cx * 1.2f;
-
-            float mag = std::sqrt(raw_shift_x * raw_shift_x +
-                                  raw_shift_y * raw_shift_y);
-            float max_allowed = radius * 0.8f;
+            float radius = std::max(cx * 1.2f, eyeRoi.height * 0.8f);
 
             float shift_x = raw_shift_x;
             float shift_y = raw_shift_y;
-            if (mag > max_allowed && mag > 0.0f) {
-              shift_x = (raw_shift_x / mag) * max_allowed;
-              shift_y = (raw_shift_y / mag) * max_allowed;
+
+            // INVERSIÓN CONDICIONAL
+            if (FLIP_CORRECTION) {
+              shift_x = -shift_x;
+              shift_y = -shift_y;
             }
 
-            const float smoothCoef = 1.0f;
-            shift_x *= smoothCoef;
-            shift_y *= smoothCoef;
+            float mag = std::sqrt(shift_x * shift_x + shift_y * shift_y);
+            float max_allowed = radius * 0.4f;
+
+            if (mag > max_allowed && mag > 0.0f) {
+              shift_x = (shift_x / mag) * max_allowed;
+              shift_y = (shift_y / mag) * max_allowed;
+            }
+
+            // Sensibilidad Amplificada + Intensidad del Efecto (Factor
+            // Dinámico)
+            shift_x *= warpMultiplier * 1.5f;
+            shift_y *= warpMultiplier * 1.5f;
+
+            // Dinámica inercial mínima de prueba para romper inercia de la zona
+            // muerta
+            if (mag < radius * 0.04f) {
+              shift_x = radius * 0.05f;
+              shift_y = 0.0f;
+            }
+
+            // Auditoría Interna: Muestreo del píxel central de la ROI
+            if (frameCounter % 30 == 0) {
+              float dist_center = 0.0f; // Distancia en px céntrico es 0
+              float factor_esferico =
+                  1.0f - (dist_center * dist_center) / (radius * radius);
+              float test_curve_x = shift_x * factor_esferico;
+              float test_curve_y = shift_y * factor_esferico;
+
+              std::cerr << "[" << sideName << " CENTER MAP] Shift vector = ("
+                        << shift_x << ", " << shift_y << ") -> Curve output = ("
+                        << test_curve_x << ", " << test_curve_y << ")"
+                        << std::endl;
+            }
 
             for (int y = 0; y < eyeRoi.height; ++y) {
               float *ptr_x = map_x.ptr<float>(y);
@@ -483,9 +544,9 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
                 float curve_x = 0.0f;
                 float curve_y = 0.0f;
                 if (dist < radius) {
-                  float curve = 1.0f - (dist * dist) / (radius * radius);
-                  curve_x = shift_x * curve;
-                  curve_y = shift_y * curve;
+                  float factor = 1.0f - (dist * dist) / (radius * radius);
+                  curve_x = shift_x * factor;
+                  curve_y = shift_y * factor;
                 }
 
                 ptr_x[x] = static_cast<float>(x) - curve_x;
@@ -554,23 +615,33 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
           float left_raw_shift_x = left_target_x - left_pupila_x_relativa;
           float left_raw_shift_y = left_target_y - left_pupila_y_relativa;
 
-          constexpr float alpha = 0.5f;
-          float left_filtered_x =
-              (alpha * last_shift_lx) + ((1.0f - alpha) * left_raw_shift_x);
-          float left_filtered_y =
-              (alpha * last_shift_ly) + ((1.0f - alpha) * left_raw_shift_y);
+          float left_deadzone = 0.04f * static_cast<float>(leftEyeRoi.width);
+          float left_delta_x = std::abs(left_raw_shift_x - last_shift_lx);
+          float left_delta_y = std::abs(left_raw_shift_y - last_shift_ly);
 
-          float left_deadzone = 0.003f * static_cast<float>(leftEyeRoi.width);
-          float left_delta_x = std::abs(left_filtered_x - last_shift_lx);
-          float left_delta_y = std::abs(left_filtered_y - last_shift_ly);
+          // Auditoría Externa Global (Cada 30 frames)
+          if (frameCounter % 30 == 0) {
+            std::cerr << "--- DIAGNOSTICO DE INVERSION [Frame " << frameCounter
+                      << "] ---\n"
+                      << "Angulos   : Pitch=" << filteredPitch
+                      << ", Yaw=" << filteredYaw << "\n"
+                      << "ROI Izq   : Width=" << leftEyeRoi.width
+                      << ", Height=" << leftEyeRoi.height << "\n"
+                      << "Target [L]: X=" << left_target_x
+                      << " Y=" << left_target_y << "\n"
+                      << "Actual [L]: X=" << left_pupila_x_relativa
+                      << " Y=" << left_pupila_y_relativa << "\n"
+                      << "Shift  [L]: DX=" << left_raw_shift_x
+                      << " DY=" << left_raw_shift_y << "\n";
+          }
 
           if (left_delta_x > left_deadzone || left_delta_y > left_deadzone) {
-            last_shift_lx = left_filtered_x;
-            last_shift_ly = left_filtered_y;
+            last_shift_lx = left_raw_shift_x;
+            last_shift_ly = left_raw_shift_y;
           }
 
           apply_spherical_warp(leftEyeRoi, left_map_x, left_map_y,
-                               last_shift_lx, last_shift_ly);
+                               last_shift_lx, last_shift_ly, "LEFT");
 
           // --- Ojo Derecho: EMA + Deadzone ---
           float right_pupila_x_abs = roi.x + landmarks[96 * 2] * roi.width;
@@ -584,23 +655,31 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
           float right_raw_shift_x = right_target_x - right_pupila_x_relativa;
           float right_raw_shift_y = right_target_y - right_pupila_y_relativa;
 
-          float right_filtered_x =
-              (alpha * last_shift_rx) + ((1.0f - alpha) * right_raw_shift_x);
-          float right_filtered_y =
-              (alpha * last_shift_ry) + ((1.0f - alpha) * right_raw_shift_y);
+          float right_deadzone = 0.04f * static_cast<float>(rightEyeRoi.width);
+          float right_delta_x = std::abs(right_raw_shift_x - last_shift_rx);
+          float right_delta_y = std::abs(right_raw_shift_y - last_shift_ry);
 
-          float right_deadzone = 0.003f * static_cast<float>(rightEyeRoi.width);
-          float right_delta_x = std::abs(right_filtered_x - last_shift_rx);
-          float right_delta_y = std::abs(right_filtered_y - last_shift_ry);
+          if (frameCounter % 30 == 0) {
+            std::cerr
+                << "ROI Der   : Width=" << rightEyeRoi.width
+                << ", Height=" << rightEyeRoi.height << "\n"
+                << "Target [R]: X=" << right_target_x << " Y=" << right_target_y
+                << "\n"
+                << "Actual [R]: X=" << right_pupila_x_relativa
+                << " Y=" << right_pupila_y_relativa << "\n"
+                << "Shift  [R]: DX=" << right_raw_shift_x
+                << " DY=" << right_raw_shift_y << "\n"
+                << "--------------------------------------------------------\n";
+          }
 
           if (right_delta_x > right_deadzone ||
               right_delta_y > right_deadzone) {
-            last_shift_rx = right_filtered_x;
-            last_shift_ry = right_filtered_y;
+            last_shift_rx = right_raw_shift_x;
+            last_shift_ry = right_raw_shift_y;
           }
 
           apply_spherical_warp(rightEyeRoi, right_map_x, right_map_y,
-                               last_shift_rx, last_shift_ry);
+                               last_shift_rx, last_shift_ry, "RIGHT");
         }
 
         // Edge-triggered logging: corrección activa
