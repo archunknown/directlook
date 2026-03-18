@@ -124,6 +124,17 @@ private:
   float filteredYaw{0.0f};
   float filteredRoll{0.0f};
 
+  // OneEuroFilter for ocular bounding boxes (Absolute Space)
+  OneEuroFilter leftEyeXFilter{1.0f, 0.07f};
+  OneEuroFilter leftEyeYFilter{1.0f, 0.07f};
+  OneEuroFilter leftEyeWFilter{1.0f, 0.07f};
+  OneEuroFilter leftEyeHFilter{1.0f, 0.07f};
+
+  OneEuroFilter rightEyeXFilter{1.0f, 0.07f};
+  OneEuroFilter rightEyeYFilter{1.0f, 0.07f};
+  OneEuroFilter rightEyeWFilter{1.0f, 0.07f};
+  OneEuroFilter rightEyeHFilter{1.0f, 0.07f};
+
   // Asymmetric hysteresis state machine
   bool effectActive{true};
   int reentryCounter{0};
