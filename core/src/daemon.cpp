@@ -180,8 +180,9 @@ int main(int argc, char **argv) {
   std::cout << "[DAEMON] Modo servicio continuo activo." << std::endl;
 
   // Inicializar rutas dinámicas con resolución heurística
-  MODEL_PATH = resolveModelPath("pfld.onnx");
-  FACE_MODEL_PATH = resolveModelPath("version-slim-320_simplified.onnx");
+  MODEL_PATH = resolveModelPath("../../modelos_fp32/pfld.onnx");
+  FACE_MODEL_PATH =
+      resolveModelPath("../../modelos_fp32/version-slim-320_simplified.onnx");
 
   // Variables para limpieza garantizada (RAII-like handling)
   std::unique_ptr<IpcServer> ipcServer =
@@ -329,18 +330,30 @@ int main(int argc, char **argv) {
 // =====================================================================
 
 int main(int argc, char **argv) {
-  int cameraIndex = 0;
   int targetFps = 30;
-  std::string targetSink = "/dev/video2";
+  std::string videoSource = "";
+  std::string videoSinkPath = "";
 
   for (int i = 1; i < argc; ++i) {
-    if (std::string(argv[i]) == "--camera" && i + 1 < argc) {
-      cameraIndex = std::stoi(argv[++i]);
-    } else if (std::string(argv[i]) == "--limit-fps" && i + 1 < argc) {
+    std::string arg = argv[i];
+    if (arg.find("--video-source=") == 0) {
+      videoSource = arg.substr(15);
+    } else if (arg == "--video-source" && i + 1 < argc) {
+      videoSource = argv[++i];
+    } else if (arg.find("--video-sink=") == 0) {
+      videoSinkPath = arg.substr(13);
+    } else if (arg == "--video-sink" && i + 1 < argc) {
+      videoSinkPath = argv[++i];
+    } else if (arg.find("--limit-fps=") == 0) {
+      targetFps = std::stoi(arg.substr(12));
+    } else if (arg == "--limit-fps" && i + 1 < argc) {
       targetFps = std::stoi(argv[++i]);
-    } else if (std::string(argv[i]) == "--sink" && i + 1 < argc) {
-      targetSink = argv[++i];
     }
+  }
+
+  if (videoSource.empty() || videoSinkPath.empty()) {
+    throw std::runtime_error("Argumentos CLI requeridos ausentes. Variables "
+                             "obligatorias: --video-source y --video-sink.");
   }
   // --- Registro de señales ---
   std::signal(SIGINT, signalHandler);
@@ -350,13 +363,14 @@ int main(int argc, char **argv) {
   std::cout << "[DAEMON] Modo servicio continuo activo." << std::endl;
 
   // Inicializar rutas dinámicas con resolución heurística
-  MODEL_PATH = resolveModelPath("pfld.onnx");
-  FACE_MODEL_PATH = resolveModelPath("version-slim-320_simplified.onnx");
+  MODEL_PATH = resolveModelPath("../../modelos_fp32/pfld.onnx");
+  FACE_MODEL_PATH =
+      resolveModelPath("../../modelos_fp32/version-slim-320_simplified.onnx");
 
   // Variables para limpieza garantizada
   std::unique_ptr<IpcServer> ipcServer = std::make_unique<UnixSocketServer>();
   std::unique_ptr<VideoSink> videoSink =
-      std::make_unique<LinuxV4l2Sink>(targetSink);
+      std::make_unique<LinuxV4l2Sink>(videoSinkPath);
 
   cv::VideoCapture cap;
   size_t frames_processed = 0;
@@ -370,11 +384,11 @@ int main(int argc, char **argv) {
     // -----------------------------------------------------------------
     // Captura de video + inyección a sumidero configurado
     // -----------------------------------------------------------------
-    cap.open(cameraIndex, cv::CAP_V4L2);
+    cap.open(videoSource, cv::CAP_V4L2);
     if (!cap.isOpened()) {
       throw std::runtime_error(
-          "Falla estructural: Imposible adquirir /dev/video" +
-          std::to_string(cameraIndex) + ".");
+          "Falla estructural: Imposible adquirir descriptor fuente en " +
+          videoSource + ".");
     }
 
     cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
