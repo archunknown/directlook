@@ -24,6 +24,7 @@ endif()
 add_executable(directlook-daemon src/daemon.cpp src/vision_pipeline.cpp src/cpu_monitor.cpp ${IPC_SOURCES} ${SINK_SOURCES})
 
 target_include_directories(directlook-daemon PRIVATE
+    ${OpenCV_INCLUDE_DIRS}
     ${ONNXRUNTIME_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../ipc
 )
@@ -31,11 +32,12 @@ target_include_directories(directlook-daemon PRIVATE
 target_link_directories(directlook-daemon PRIVATE ${ONNXRUNTIME_LIB_DIR})
 target_link_libraries(directlook-daemon PRIVATE ${OpenCV_LIBS} onnxruntime)
 
-# Roll mode: rotation (default) or attenuation (Plan B for high latency)
-option(DIRECTLOOK_ROLL_ATTENUATION "Use roll attenuation instead of map rotation" OFF)
-if(DIRECTLOOK_ROLL_ATTENUATION)
-  target_compile_definitions(directlook-daemon PRIVATE DIRECTLOOK_ROLL_MODE_ATTENUATION)
-endif()
+# Copiar modelos al directorio de salida
+add_custom_command(TARGET directlook-daemon POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+    ${CMAKE_CURRENT_SOURCE_DIR}/../modelos
+    ${CMAKE_CURRENT_BINARY_DIR}/modelos
+)
 
 # Windows: linkear psapi.lib para GetProcessMemoryInfo
 if(WIN32)

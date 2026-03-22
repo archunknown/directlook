@@ -3,7 +3,6 @@
 // Sprint 2: Servicio Continuo · Canal IPC · Protocolo de Telemetría
 // =============================================================================
 
-// --- Includes comunes (agnósticos de plataforma) ---
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -17,12 +16,11 @@
 #include <thread>
 #include <vector>
 
+#include "InpaintingEngine.hpp"
 #include "cpu_monitor.h"
 #include "ipc_server.h"
 #include "protocol.h"
 #include "vision_pipeline.h"
-
-// --- Includes condicionales de plataforma ---
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -31,24 +29,18 @@
 #include <psapi.h>
 #include <windows.h>
 #else
-
 #include "ipc_unix.h"
 #include "video_sink_unix.h"
 #include <fcntl.h>
 #include <fstream>
 #include <sys/ioctl.h>
 #include <unistd.h>
-
 #endif
 
-// =============================================================================
-// Variable atómica global de control de ejecución
-// =============================================================================
 std::atomic<bool> keepRunning{true};
 
 void signalHandler(int signum) {
   keepRunning.store(false);
-  // write() es async-signal-safe; cout no lo es, pero es aceptable aquí
   const char *msg = "\n[SIGNAL] Señal interceptada. Iniciando shutdown...\n";
 #ifdef _WIN32
   DWORD written;
@@ -60,9 +52,6 @@ void signalHandler(int signum) {
   (void)signum;
 }
 
-// =============================================================================
-// Utilidades Multiplataforma
-// =============================================================================
 std::string getExecutableDir() {
 #ifdef _WIN32
   char path[MAX_PATH];
@@ -84,35 +73,24 @@ std::string getExecutableDir() {
 
 std::string resolveModelPath(const std::string &modelName) {
   std::string exeDir = getExecutableDir();
-  // Posibles ubicaciones relativas al ejecutable:
-  // 1. Mismo directorio (producción flat)
-  // 2. Un nivel arriba (típico Linux: build/core -> build/modelos)
-  // 3. Dos niveles arriba (típico MSVC: build/core/Release -> build/modelos)
   std::vector<std::string> searchPaths = {
       exeDir + "/modelos/" + modelName, exeDir + "/../modelos/" + modelName,
       exeDir + "/../../modelos/" + modelName};
 
   for (const auto &path : searchPaths) {
-    // Verificación rápida de existencia de archivo usando fopen
     FILE *f = fopen(path.c_str(), "rb");
     if (f) {
       fclose(f);
       return path;
     }
   }
-  return exeDir + "/modelos/" + modelName; // Fallback
+  return exeDir + "/modelos/" + modelName;
 }
 
-// =============================================================================
-// Constantes y variables arquitectónicas
-// =============================================================================
-static constexpr size_t MEMORY_LIMIT_BYTES = 125 * 1024 * 1024; // 125 MB
+static constexpr size_t MEMORY_LIMIT_BYTES = 125 * 1024 * 1024;
 std::string MODEL_PATH;
 std::string FACE_MODEL_PATH;
 
-// =============================================================================
-// [FASE 1] Monitor de Memoria Multiplataforma
-// =============================================================================
 size_t getProcessMemory() {
 #ifdef _WIN32
   PROCESS_MEMORY_COUNTERS_EX pmcEx;
@@ -136,9 +114,6 @@ size_t getProcessMemory() {
 #endif
 }
 
-// =============================================================================
-// Utilidad: Procesar comando IPC (protocolo binario de 1 byte)
-// =============================================================================
 bool processIpcCommand(uint8_t byte, bool &effectEnabled) {
   if (byte == DIRECTLOOK_CMD_DISABLE) {
     effectEnabled = false;
@@ -152,16 +127,10 @@ bool processIpcCommand(uint8_t byte, bool &effectEnabled) {
   return false;
 }
 
-// =============================================================================
-// Arquitecturas de plataforma (main separados)
-// =============================================================================
-
 #ifdef _WIN32
-
 // =====================================================================
 // ARQUITECTURA WINDOWS (DirectShow / MSMF + Named Pipe IPC)
 // =====================================================================
-
 int main(int argc, char **argv) {
   int cameraIndex = 0;
   int targetFps = 30;
@@ -172,19 +141,16 @@ int main(int argc, char **argv) {
       targetFps = std::stoi(argv[++i]);
     }
   }
-  // --- Registro de señales ---
   std::signal(SIGINT, signalHandler);
   std::signal(SIGTERM, signalHandler);
 
   std::cout << "=== DirectLook Daemon [Windows] ===" << std::endl;
-  std::cout << "[DAEMON] Modo servicio continuo activo." << std::endl;
+  MODEL_PATH = resolveModelPath("pfld.onnx");
+  FACE_MODEL_PATH = resolveModelPath("version-slim-320_simplified.onnx");
+  std::string INPAINT_MODEL_PATH = resolveModelPath("inpainting_fp32.onnx");
 
-  // Inicializar rutas dinámicas con resolución heurística
-  MODEL_PATH = resolveModelPath("../../modelos_fp32/pfld.onnx");
-  FACE_MODEL_PATH =
-      resolveModelPath("../../modelos_fp32/version-slim-320_simplified.onnx");
+  InpaintingEngine inpainter(INPAINT_MODEL_PATH);
 
-  // Variables para limpieza garantizada (RAII-like handling)
   std::unique_ptr<IpcServer> ipcServer =
       std::make_unique<WindowsNamedPipeServer>();
   std::unique_ptr<VideoSink> videoSink =
@@ -195,44 +161,23 @@ int main(int argc, char **argv) {
   double total_latency = 0.0;
 
   try {
-
-    // Reporte de memoria pre-inicialización
-    size_t memInicio = getProcessMemory();
-    std::cout << "[MEMORIA] Inicio del proceso: "
-              << (memInicio / (1024.0 * 1024.0)) << " MB" << std::endl;
-
-    // -----------------------------------------------------------------
-    // Captura de video e Inicialización Asistida
-    // -----------------------------------------------------------------
     cap.open(cameraIndex, cv::CAP_DSHOW);
-    if (!cap.isOpened()) {
-      std::cerr << "Falla estructural: Imposible adquirir cámara "
-                << cameraIndex << " en Windows." << std::endl;
-      return 1;
-    }
+    if (!cap.isOpened())
+      throw std::runtime_error("Falla estructural: Cámara inaccesible.");
+
     cap.set(cv::CAP_PROP_FPS, targetFps);
     double actualFps = cap.get(cv::CAP_PROP_FPS);
     if (actualFps <= 0)
       actualFps = targetFps;
 
-    // -----------------------------------------------------------------
-    // Instanciación del Motor ONNX Runtime (CPU)
-    // -----------------------------------------------------------------
     VisionPipeline vision(FACE_MODEL_PATH, MODEL_PATH, actualFps);
 
     bool effectEnabled = true;
     uint8_t asyncCmdByte = 0;
-
-    // -----------------------------------------------------------------
-    // Bucle principal perpetuo
-    // -----------------------------------------------------------------
-    std::cout << "[DAEMON] Servicio activo. Ctrl+C para detener." << std::endl;
-
     CpuMonitor monitor;
     cv::Mat frame;
     int emptyFrameCount = 0;
 
-    // --- Watchdog Telemetría IPC Asíncrona ---
     std::thread ipcWatchdog([&monitor, &ipcServer]() {
       bool alarmSent = false;
       while (keepRunning.load()) {
@@ -240,95 +185,74 @@ int main(int argc, char **argv) {
         if (level == 3 && !alarmSent) {
           ipcServer->sendTelemetry(DIRECTLOOK_CMD_THERMAL_ALARM);
           alarmSent = true;
-        } else if (level < 3) {
+        } else if (level < 3)
           alarmSent = false;
-        }
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
       }
     });
 
-    auto lastFrameTime = std::chrono::high_resolution_clock::now();
-
     while (keepRunning.load()) {
-      // --- Sondeo IPC (ANTES de lectura de hardware) ---
-      if (ipcServer->pollCommand(asyncCmdByte)) {
+      if (ipcServer->pollCommand(asyncCmdByte))
         processIpcCommand(asyncCmdByte, effectEnabled);
-      }
 
       cap.read(frame);
       if (frame.empty()) {
         emptyFrameCount++;
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        if (emptyFrameCount >= 90) {
-          throw std::runtime_error(
-              "Falla cr\u00edtica: Hardware de video inoperante por 3 "
-              "segundos. Abortando proceso.");
-        }
+        if (emptyFrameCount >= 90)
+          throw std::runtime_error("Falla crítica de hardware.");
         continue;
       }
       emptyFrameCount = 0;
 
       cv::resize(frame, frame, cv::Size(640, 360));
-
-      auto now = std::chrono::high_resolution_clock::now();
-      float dt = std::chrono::duration<float>(now - lastFrameTime).count();
-      if (dt <= 0.0f)
-        dt = 1.0f / 30.0f;
-      lastFrameTime = now;
-
       auto start = std::chrono::high_resolution_clock::now();
-
       int level = monitor.getDegradationLevel();
 
-      vision.process(frame, effectEnabled, level, dt);
+      vision.process(frame, effectEnabled, level);
+
+      if (effectEnabled && level < 3 && vision.hasValidEyes()) {
+        cv::Rect leftRoi = vision.getLeftEyeRoi();
+        cv::Rect rightRoi = vision.getRightEyeRoi();
+
+        if (leftRoi.area() > 0 && rightRoi.area() > 0) {
+          cv::Mat leftCrop = frame(leftRoi);
+          cv::Mat rightCrop = frame(rightRoi);
+
+          cv::Mat newLeftEye = inpainter.processEye(leftCrop);
+          cv::Mat newRightEye = inpainter.processEye(rightCrop);
+
+          if (!newLeftEye.empty() && newLeftEye.size() == leftRoi.size()) {
+            newLeftEye.copyTo(frame(leftRoi));
+          }
+          if (!newRightEye.empty() && newRightEye.size() == rightRoi.size()) {
+            newRightEye.copyTo(frame(rightRoi));
+          }
+        }
+      }
 
       videoSink->writeFrame(frame);
-
       auto end = std::chrono::high_resolution_clock::now();
-      std::chrono::duration<double, std::milli> elapsed = end - start;
-      total_latency += elapsed.count();
+      total_latency +=
+          std::chrono::duration<double, std::milli>(end - start).count();
       frames_processed++;
     }
-
     keepRunning.store(false);
-    if (ipcWatchdog.joinable()) {
+    if (ipcWatchdog.joinable())
       ipcWatchdog.join();
-    }
-
   } catch (const std::exception &e) {
     std::cerr << "Excepcion capturada: " << e.what() << std::endl;
   }
 
-  // -----------------------------------------------------------------
-  // Shutdown: higiene de descriptores
-  // -----------------------------------------------------------------
-  std::cout << "\n[DAEMON] Iniciando shutdown limpio..." << std::endl;
-
-  // IpcServer release and closing handles is managed by std::unique_ptr DAII
   ipcServer.reset();
-
-  if (frames_processed > 0) {
-    std::cout << "[RESULTADO] Frames totales: " << frames_processed
-              << std::endl;
-    std::cout << "[RESULTADO] Latencia promedio: "
-              << (total_latency / frames_processed) << " ms" << std::endl;
-  }
-
-  size_t memFinal = getProcessMemory();
-  std::cout << "[MEMORIA] Fin del pipeline: " << (memFinal / (1024.0 * 1024.0))
-            << " MB" << std::endl;
-
   cap.release();
-  std::cout << "[DAEMON] Shutdown limpio completado." << std::endl;
   return 0;
 }
 
 #else
-
 // =====================================================================
 // ARQUITECTURA LINUX (v4l2loopback + Unix Domain Socket IPC)
 // =====================================================================
-
 int main(int argc, char **argv) {
   int targetFps = 30;
   std::string videoSource = "";
@@ -336,38 +260,34 @@ int main(int argc, char **argv) {
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
-    if (arg.find("--video-source=") == 0) {
+    if (arg.find("--video-source=") == 0)
       videoSource = arg.substr(15);
-    } else if (arg == "--video-source" && i + 1 < argc) {
+    else if (arg == "--video-source" && i + 1 < argc)
       videoSource = argv[++i];
-    } else if (arg.find("--video-sink=") == 0) {
+    else if (arg.find("--video-sink=") == 0)
       videoSinkPath = arg.substr(13);
-    } else if (arg == "--video-sink" && i + 1 < argc) {
+    else if (arg == "--video-sink" && i + 1 < argc)
       videoSinkPath = argv[++i];
-    } else if (arg.find("--limit-fps=") == 0) {
+    else if (arg.find("--limit-fps=") == 0)
       targetFps = std::stoi(arg.substr(12));
-    } else if (arg == "--limit-fps" && i + 1 < argc) {
+    else if (arg == "--limit-fps" && i + 1 < argc)
       targetFps = std::stoi(argv[++i]);
-    }
   }
 
   if (videoSource.empty() || videoSinkPath.empty()) {
-    throw std::runtime_error("Argumentos CLI requeridos ausentes. Variables "
-                             "obligatorias: --video-source y --video-sink.");
+    throw std::runtime_error(
+        "Argumentos CLI requeridos ausentes: --video-source y --video-sink.");
   }
-  // --- Registro de señales ---
   std::signal(SIGINT, signalHandler);
   std::signal(SIGTERM, signalHandler);
 
   std::cout << "=== DirectLook Daemon [Linux] ===" << std::endl;
-  std::cout << "[DAEMON] Modo servicio continuo activo." << std::endl;
+  MODEL_PATH = resolveModelPath("pfld.onnx");
+  FACE_MODEL_PATH = resolveModelPath("version-slim-320_simplified.onnx");
+  std::string INPAINT_MODEL_PATH = resolveModelPath("inpainting_fp32.onnx");
 
-  // Inicializar rutas dinámicas con resolución heurística
-  MODEL_PATH = resolveModelPath("../../modelos_fp32/pfld.onnx");
-  FACE_MODEL_PATH =
-      resolveModelPath("../../modelos_fp32/version-slim-320_simplified.onnx");
+  InpaintingEngine inpainter(INPAINT_MODEL_PATH);
 
-  // Variables para limpieza garantizada
   std::unique_ptr<IpcServer> ipcServer = std::make_unique<UnixSocketServer>();
   std::unique_ptr<VideoSink> videoSink =
       std::make_unique<LinuxV4l2Sink>(videoSinkPath);
@@ -377,19 +297,10 @@ int main(int argc, char **argv) {
   double total_latency = 0.0;
 
   try {
-    size_t memInicio = getProcessMemory();
-    std::cout << "[MEMORIA] Inicio del proceso: "
-              << (memInicio / (1024.0 * 1024.0)) << " MB" << std::endl;
-
-    // -----------------------------------------------------------------
-    // Captura de video + inyección a sumidero configurado
-    // -----------------------------------------------------------------
     cap.open(videoSource, cv::CAP_V4L2);
-    if (!cap.isOpened()) {
+    if (!cap.isOpened())
       throw std::runtime_error(
-          "Falla estructural: Imposible adquirir descriptor fuente en " +
-          videoSource + ".");
-    }
+          "Falla estructural: Descriptor fuente inaccesible.");
 
     cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
     cap.set(cv::CAP_PROP_FRAME_HEIGHT, 360);
@@ -400,24 +311,13 @@ int main(int argc, char **argv) {
     if (actualFps <= 0)
       actualFps = targetFps;
 
-    // -----------------------------------------------------------------
-    // Instanciación del Motor ONNX Runtime (CPU)
-    // -----------------------------------------------------------------
     VisionPipeline vision(FACE_MODEL_PATH, MODEL_PATH, actualFps);
 
     bool effectEnabled = true;
-
-    // -----------------------------------------------------------------
-    // Bucle principal perpetuo
-    // -----------------------------------------------------------------
-    std::cout << "[DAEMON] Servicio activo. kill -SIGINT <pid> para detener."
-              << std::endl;
-
     CpuMonitor monitor;
     cv::Mat frame;
     int emptyFrameCount = 0;
 
-    // --- Watchdog Telemetría IPC Asíncrona ---
     std::thread ipcWatchdog([&monitor, &ipcServer]() {
       bool alarmSent = false;
       while (keepRunning.load()) {
@@ -425,88 +325,69 @@ int main(int argc, char **argv) {
         if (level == 3 && !alarmSent) {
           ipcServer->sendTelemetry(DIRECTLOOK_CMD_THERMAL_ALARM);
           alarmSent = true;
-        } else if (level < 3) {
+        } else if (level < 3)
           alarmSent = false;
-        }
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
       }
     });
 
-    auto lastFrameTime = std::chrono::high_resolution_clock::now();
-
     while (keepRunning.load()) {
-      // --- Sondeo IPC (ANTES de lectura de hardware) ---
       uint8_t cmdByte;
-      if (ipcServer->pollCommand(cmdByte)) {
+      if (ipcServer->pollCommand(cmdByte))
         processIpcCommand(cmdByte, effectEnabled);
-      }
 
       cap.read(frame);
       if (frame.empty()) {
         emptyFrameCount++;
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        if (emptyFrameCount >= 90) {
-          throw std::runtime_error(
-              "Falla cr\u00edtica: Hardware de video inoperante por 3 "
-              "segundos. Abortando proceso.");
-        }
+        if (emptyFrameCount >= 90)
+          throw std::runtime_error("Falla crítica de video.");
         continue;
       }
       emptyFrameCount = 0;
 
       cv::resize(frame, frame, cv::Size(640, 360));
-
-      auto now = std::chrono::high_resolution_clock::now();
-      float dt = std::chrono::duration<float>(now - lastFrameTime).count();
-      if (dt <= 0.0f)
-        dt = 1.0f / 30.0f;
-      lastFrameTime = now;
-
       auto start = std::chrono::high_resolution_clock::now();
-
       int level = monitor.getDegradationLevel();
 
-      vision.process(frame, effectEnabled, level, dt);
+      vision.process(frame, effectEnabled, level);
+
+      if (effectEnabled && level < 3 && vision.hasValidEyes()) {
+        cv::Rect leftRoi = vision.getLeftEyeRoi();
+        cv::Rect rightRoi = vision.getRightEyeRoi();
+
+        if (leftRoi.area() > 0 && rightRoi.area() > 0) {
+          cv::Mat leftCrop = frame(leftRoi);
+          cv::Mat rightCrop = frame(rightRoi);
+
+          cv::Mat newLeftEye = inpainter.processEye(leftCrop);
+          cv::Mat newRightEye = inpainter.processEye(rightCrop);
+
+          if (!newLeftEye.empty() && newLeftEye.size() == leftRoi.size()) {
+            newLeftEye.copyTo(frame(leftRoi));
+          }
+          if (!newRightEye.empty() && newRightEye.size() == rightRoi.size()) {
+            newRightEye.copyTo(frame(rightRoi));
+          }
+        }
+      }
 
       videoSink->writeFrame(frame);
-
       auto end = std::chrono::high_resolution_clock::now();
-      std::chrono::duration<double, std::milli> elapsed = end - start;
-      total_latency += elapsed.count();
+      total_latency +=
+          std::chrono::duration<double, std::milli>(end - start).count();
       frames_processed++;
     }
-
     keepRunning.store(false);
-    if (ipcWatchdog.joinable()) {
+    if (ipcWatchdog.joinable())
       ipcWatchdog.join();
-    }
   } catch (const std::exception &e) {
     std::cerr << "Excepcion capturada: " << e.what() << std::endl;
   }
 
-  // -----------------------------------------------------------------
-  // Shutdown: higiene de descriptores y desvinculado de sockets
-  // -----------------------------------------------------------------
-  std::cout << "\n[DAEMON] Iniciando shutdown limpio..." << std::endl;
-
-  // IpcServer release and closing descriptors is managed by std::unique_ptr
-  // RAII
   ipcServer.reset();
-
-  if (frames_processed > 0) {
-    std::cout << "[RESULTADO] Frames totales: " << frames_processed
-              << std::endl;
-    std::cout << "[RESULTADO] Latencia promedio: "
-              << (total_latency / frames_processed) << " ms" << std::endl;
-  }
-
-  size_t memFinal = getProcessMemory();
-  std::cout << "[MEMORIA] Fin del pipeline: " << (memFinal / (1024.0 * 1024.0))
-            << " MB" << std::endl;
-
   if (cap.isOpened())
     cap.release();
-  std::cout << "[DAEMON] Shutdown limpio completado." << std::endl;
   return 0;
 }
 #endif

@@ -18,3 +18,10 @@ modelos_fp32/
 
 # Ignorar modelos compilados (generados localmente)
 *.onnx
+
+# Ignorar dataset
+dataset_ojos/
+.o
+directlook-daemon
+__pycache__
+compile_commands.json
