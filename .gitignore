@@ -12,7 +12,7 @@ venv/
 .venv/
 
 # Artefactos locales de calibración y transmutación
-rostro.mp4
+myface.mp4
 datos_calibracion/
 modelos_fp32/
 
@@ -21,7 +21,9 @@ modelos_fp32/
 
 # Ignorar dataset
 dataset_ojos/
-.o
+*.o
 directlook-daemon
 __pycache__
 compile_commands.json
+
+telemetria.csv

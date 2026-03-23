@@ -9,7 +9,10 @@ VisionPipeline::VisionPipeline(const std::string &faceModelPath,
                                const std::string &modelPath, double fps)
     : env(ORT_LOGGING_LEVEL_WARNING, "DirectLookPipeline"),
       faceInputTensorValues(3 * 240 * 320, 0.0f),
-      pfldInputTensorValues(3 * 112 * 112, 0.0f) {
+      pfldInputTensorValues(3 * 112 * 112, 0.0f),
+      landmarkFilter_(OneEuroFilterConfig{fps > 0.0 ? fps : 30.0, 1.2, 0.02,
+                                          1.0, 0.5}),
+      nominalDtSeconds_(fps > 0.0 ? 1.0 / fps : 1.0 / 30.0) {
 
   sessionOptions.SetIntraOpNumThreads(1);
   sessionOptions.SetGraphOptimizationLevel(
@@ -65,6 +68,72 @@ VisionPipeline::VisionPipeline(const std::string &faceModelPath,
 
 VisionPipeline::~VisionPipeline() {}
 
+void VisionPipeline::resetTemporalState() {
+  landmarkFilter_.reset();
+  hasLastLandmarkTimestamp_ = false;
+}
+
+bool VisionPipeline::estimateHeadPose(
+    const OneEuroLandmarkFilter::LandmarkArray &stabilizedLandmarks,
+    int frameWidth, int frameHeight, EulerAnglesDeg &headPoseDeg) const {
+  const std::array<int, 6> landmarkIndices = {16, 57, 60, 72, 76, 82};
+  const std::array<cv::Point3d, 6> modelPoints = {
+      cv::Point3d(0.0, 63.6, -12.5),   cv::Point3d(0.0, 0.0, 0.0),
+      cv::Point3d(-43.3, -32.7, -26.0), cv::Point3d(43.3, -32.7, -26.0),
+      cv::Point3d(-28.9, 28.9, -24.1), cv::Point3d(28.9, 28.9, -24.1)};
+
+  std::vector<cv::Point2d> imagePoints;
+  imagePoints.reserve(landmarkIndices.size());
+  for (int index : landmarkIndices) {
+    imagePoints.emplace_back(stabilizedLandmarks[index * 2],
+                             stabilizedLandmarks[index * 2 + 1]);
+  }
+
+  const double focalLength = static_cast<double>(std::max(frameWidth, frameHeight));
+  const cv::Point2d principalPoint(frameWidth / 2.0, frameHeight / 2.0);
+  const cv::Mat cameraMatrix =
+      (cv::Mat_<double>(3, 3) << focalLength, 0.0, principalPoint.x, 0.0,
+       focalLength, principalPoint.y, 0.0, 0.0, 1.0);
+  const cv::Mat distCoeffs = cv::Mat::zeros(4, 1, CV_64F);
+
+  cv::Mat rvec;
+  cv::Mat tvec;
+  if (!cv::solvePnP(modelPoints, imagePoints, cameraMatrix, distCoeffs, rvec,
+                    tvec, false, cv::SOLVEPNP_ITERATIVE)) {
+    return false;
+  }
+
+  cv::Mat rotationMatrix;
+  cv::Rodrigues(rvec, rotationMatrix);
+
+  const double sy = std::sqrt(rotationMatrix.at<double>(0, 0) *
+                                  rotationMatrix.at<double>(0, 0) +
+                              rotationMatrix.at<double>(1, 0) *
+                                  rotationMatrix.at<double>(1, 0));
+  const bool singular = sy < 1e-6;
+
+  double pitch = 0.0;
+  double yaw = 0.0;
+  double roll = 0.0;
+  if (!singular) {
+    pitch = std::atan2(rotationMatrix.at<double>(2, 1),
+                       rotationMatrix.at<double>(2, 2));
+    yaw = std::atan2(-rotationMatrix.at<double>(2, 0), sy);
+    roll = std::atan2(rotationMatrix.at<double>(1, 0),
+                      rotationMatrix.at<double>(0, 0));
+  } else {
+    pitch = std::atan2(-rotationMatrix.at<double>(1, 2),
+                       rotationMatrix.at<double>(1, 1));
+    yaw = std::atan2(-rotationMatrix.at<double>(2, 0), sy);
+  }
+
+  constexpr double kRadToDeg = 180.0 / 3.14159265358979323846;
+  headPoseDeg.pitch = pitch * kRadToDeg;
+  headPoseDeg.yaw = yaw * kRadToDeg;
+  headPoseDeg.roll = roll * kRadToDeg;
+  return true;
+}
+
 void VisionPipeline::generatePriors(int img_w, int img_h) {
   priors.clear();
   std::vector<int> strides = {8, 16, 32, 64};
@@ -102,8 +171,10 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
   currentLeftRoi = cv::Rect();
   currentRightRoi = cv::Rect();
 
-  if (!effectEnabled || degradationLevel >= 3 || frame.empty())
+  if (!effectEnabled || degradationLevel >= 3 || frame.empty()) {
+    resetTemporalState();
     return;
+  }
 
   int w_f = frame.cols;
   int h_f = frame.rows;
@@ -154,8 +225,10 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
       }
     }
 
-    if (best_score < 0.7f || best_idx == -1)
+    if (best_score < 0.7f || best_idx == -1) {
+      resetTemporalState();
       return;
+    }
 
     float pcx = priors[best_idx][0];
     float pcy = priors[best_idx][1];
@@ -188,8 +261,10 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
     int face_w = face_x2 - face_x1;
     int face_h = face_y2 - face_y1;
 
-    if (face_w < 10 || face_h < 10)
+    if (face_w < 10 || face_h < 10) {
+      resetTemporalState();
       return;
+    }
 
     cv::Mat face_crop = frame(cv::Rect(face_x1, face_y1, face_w, face_h));
 
@@ -222,17 +297,40 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
                      1, pfldOutputNames, 1);
 
     const float *landmarks = pfldOutputTensors[0].GetTensorData<float>();
+    OneEuroLandmarkFilter::LandmarkArray absoluteLandmarks{};
+    for (std::size_t i = 0; i < OneEuroLandmarkFilter::kLandmarkCount; ++i) {
+      float lx = landmarks[i * 2];
+      float ly = landmarks[i * 2 + 1];
+      absoluteLandmarks[i * 2] = face_x1 + lx * face_w;
+      absoluteLandmarks[i * 2 + 1] = face_y1 + ly * face_h;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    double dtSeconds = nominalDtSeconds_;
+    if (hasLastLandmarkTimestamp_) {
+      dtSeconds = std::chrono::duration<double>(now - lastLandmarkTimestamp_)
+                      .count();
+      if (dtSeconds > 0.5) {
+        landmarkFilter_.reset();
+        dtSeconds = nominalDtSeconds_;
+      }
+    }
+    lastLandmarkTimestamp_ = now;
+    hasLastLandmarkTimestamp_ = true;
+
+    const auto stabilizedLandmarks =
+        landmarkFilter_.filterAbsolute(absoluteLandmarks, dtSeconds);
+    EulerAnglesDeg headPoseDeg{};
+    const bool hasHeadPose =
+        estimateHeadPose(stabilizedLandmarks, w_f, h_f, headPoseDeg);
 
     auto create64x64Roi = [&](int start_idx, int end_idx) -> cv::Rect {
       float min_x = 1e9f, max_x = -1e9f;
       float min_y = 1e9f, max_y = -1e9f;
 
       for (int i = start_idx; i <= end_idx; ++i) {
-        float lx = landmarks[i * 2 + 0];
-        float ly = landmarks[i * 2 + 1];
-
-        float abs_x = face_x1 + lx * face_w;
-        float abs_y = face_y1 + ly * face_h;
+        float abs_x = stabilizedLandmarks[i * 2];
+        float abs_y = stabilizedLandmarks[i * 2 + 1];
 
         if (abs_x < min_x)
           min_x = abs_x;
@@ -276,16 +374,45 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
       return cv::Rect();
     };
 
-    currentLeftRoi = create64x64Roi(36, 41);
-    currentRightRoi = create64x64Roi(42, 47);
+    currentLeftRoi = create64x64Roi(60, 67);
+    currentRightRoi = create64x64Roi(68, 75);
 
     if (currentLeftRoi.area() > 0 && currentRightRoi.area() > 0) {
       validEyes = true;
+
+      if (hasHeadPose) {
+        cv::Mat leftEyeCrop = frame(currentLeftRoi).clone();
+        cv::Mat rightEyeCrop = frame(currentRightRoi).clone();
+
+        auto blendEye = [&](const cv::Rect &roi, const cv::Mat &eyeCrop) {
+          cv::Mat renderedEye = geometryEngine_.renderEye(eyeCrop, headPoseDeg);
+          cv::Mat blendMask = geometryEngine_.createBlendMask(eyeCrop.size());
+          if (renderedEye.empty() || renderedEye.size() != eyeCrop.size() ||
+              renderedEye.type() != eyeCrop.type() || blendMask.empty()) {
+            return;
+          }
+
+          const cv::Point center(roi.x + roi.width / 2, roi.y + roi.height / 2);
+          cv::Mat blendedFrame;
+          cv::seamlessClone(renderedEye, frame, blendMask, center, blendedFrame,
+                            cv::NORMAL_CLONE);
+          frame = blendedFrame;
+        };
+
+        blendEye(currentLeftRoi, leftEyeCrop);
+        blendEye(currentRightRoi, rightEyeCrop);
+      }
     }
 
   } catch (const Ort::Exception &e) {
     std::cerr << "[Pipeline] Hardware ONNX abortado geométricamente: "
               << e.what() << std::endl;
     validEyes = false;
+    resetTemporalState();
+  } catch (const cv::Exception &e) {
+    std::cerr << "[Pipeline] OpenCV abortado geométricamente: " << e.what()
+              << std::endl;
+    validEyes = false;
+    resetTemporalState();
   }
 }
