@@ -16,7 +16,6 @@
 #include <thread>
 #include <vector>
 
-#include "InpaintingEngine.hpp"
 #include "cpu_monitor.h"
 #include "ipc_server.h"
 #include "protocol.h"
@@ -87,6 +86,22 @@ std::string resolveModelPath(const std::string &modelName) {
   return exeDir + "/modelos/" + modelName;
 }
 
+std::string resolveProjectFilePath(const std::string &fileName) {
+  std::string exeDir = getExecutableDir();
+  std::vector<std::string> searchPaths = {exeDir + "/" + fileName,
+                                          exeDir + "/../" + fileName,
+                                          exeDir + "/../../" + fileName};
+
+  for (const auto &path : searchPaths) {
+    FILE *f = fopen(path.c_str(), "rb");
+    if (f) {
+      fclose(f);
+      return path;
+    }
+  }
+  return fileName;
+}
+
 static constexpr size_t MEMORY_LIMIT_BYTES = 125 * 1024 * 1024;
 std::string MODEL_PATH;
 std::string FACE_MODEL_PATH;
@@ -147,9 +162,7 @@ int main(int argc, char **argv) {
   std::cout << "=== DirectLook Daemon [Windows] ===" << std::endl;
   MODEL_PATH = resolveModelPath("pfld.onnx");
   FACE_MODEL_PATH = resolveModelPath("version-slim-320_simplified.onnx");
-  std::string INPAINT_MODEL_PATH = resolveModelPath("inpainting_fp32.onnx");
-
-  InpaintingEngine inpainter(INPAINT_MODEL_PATH);
+  const std::string videoPath = resolveProjectFilePath("myface.mp4");
 
   std::unique_ptr<IpcServer> ipcServer =
       std::make_unique<WindowsNamedPipeServer>();
@@ -161,9 +174,9 @@ int main(int argc, char **argv) {
   double total_latency = 0.0;
 
   try {
-    cap.open(cameraIndex, cv::CAP_DSHOW);
+    cap.open(videoPath);
     if (!cap.isOpened())
-      throw std::runtime_error("Falla estructural: Cámara inaccesible.");
+      throw std::runtime_error("Falla estructural: Archivo myface.mp4 inaccesible.");
 
     cap.set(cv::CAP_PROP_FPS, targetFps);
     double actualFps = cap.get(cv::CAP_PROP_FPS);
@@ -176,7 +189,6 @@ int main(int argc, char **argv) {
     uint8_t asyncCmdByte = 0;
     CpuMonitor monitor;
     cv::Mat frame;
-    int emptyFrameCount = 0;
 
     std::thread ipcWatchdog([&monitor, &ipcServer]() {
       bool alarmSent = false;
@@ -196,40 +208,14 @@ int main(int argc, char **argv) {
         processIpcCommand(asyncCmdByte, effectEnabled);
 
       cap.read(frame);
-      if (frame.empty()) {
-        emptyFrameCount++;
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        if (emptyFrameCount >= 90)
-          throw std::runtime_error("Falla crítica de hardware.");
-        continue;
-      }
-      emptyFrameCount = 0;
+      if (frame.empty())
+        break;
 
       cv::resize(frame, frame, cv::Size(640, 360));
       auto start = std::chrono::high_resolution_clock::now();
       int level = monitor.getDegradationLevel();
 
       vision.process(frame, effectEnabled, level);
-
-      if (effectEnabled && level < 3 && vision.hasValidEyes()) {
-        cv::Rect leftRoi = vision.getLeftEyeRoi();
-        cv::Rect rightRoi = vision.getRightEyeRoi();
-
-        if (leftRoi.area() > 0 && rightRoi.area() > 0) {
-          cv::Mat leftCrop = frame(leftRoi);
-          cv::Mat rightCrop = frame(rightRoi);
-
-          cv::Mat newLeftEye = inpainter.processEye(leftCrop);
-          cv::Mat newRightEye = inpainter.processEye(rightCrop);
-
-          if (!newLeftEye.empty() && newLeftEye.size() == leftRoi.size()) {
-            newLeftEye.copyTo(frame(leftRoi));
-          }
-          if (!newRightEye.empty() && newRightEye.size() == rightRoi.size()) {
-            newRightEye.copyTo(frame(rightRoi));
-          }
-        }
-      }
 
       videoSink->writeFrame(frame);
       auto end = std::chrono::high_resolution_clock::now();
@@ -274,9 +260,8 @@ int main(int argc, char **argv) {
       targetFps = std::stoi(argv[++i]);
   }
 
-  if (videoSource.empty() || videoSinkPath.empty()) {
-    throw std::runtime_error(
-        "Argumentos CLI requeridos ausentes: --video-source y --video-sink.");
+  if (videoSinkPath.empty()) {
+    throw std::runtime_error("Argumento CLI requerido ausente: --video-sink.");
   }
   std::signal(SIGINT, signalHandler);
   std::signal(SIGTERM, signalHandler);
@@ -284,9 +269,7 @@ int main(int argc, char **argv) {
   std::cout << "=== DirectLook Daemon [Linux] ===" << std::endl;
   MODEL_PATH = resolveModelPath("pfld.onnx");
   FACE_MODEL_PATH = resolveModelPath("version-slim-320_simplified.onnx");
-  std::string INPAINT_MODEL_PATH = resolveModelPath("inpainting_fp32.onnx");
-
-  InpaintingEngine inpainter(INPAINT_MODEL_PATH);
+  videoSource = resolveProjectFilePath("myface.mp4");
 
   std::unique_ptr<IpcServer> ipcServer = std::make_unique<UnixSocketServer>();
   std::unique_ptr<VideoSink> videoSink =
@@ -297,10 +280,10 @@ int main(int argc, char **argv) {
   double total_latency = 0.0;
 
   try {
-    cap.open(videoSource, cv::CAP_V4L2);
+    cap.open(videoSource);
     if (!cap.isOpened())
       throw std::runtime_error(
-          "Falla estructural: Descriptor fuente inaccesible.");
+          "Falla estructural: Archivo myface.mp4 inaccesible.");
 
     cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
     cap.set(cv::CAP_PROP_FRAME_HEIGHT, 360);
@@ -316,7 +299,6 @@ int main(int argc, char **argv) {
     bool effectEnabled = true;
     CpuMonitor monitor;
     cv::Mat frame;
-    int emptyFrameCount = 0;
 
     std::thread ipcWatchdog([&monitor, &ipcServer]() {
       bool alarmSent = false;
@@ -337,40 +319,14 @@ int main(int argc, char **argv) {
         processIpcCommand(cmdByte, effectEnabled);
 
       cap.read(frame);
-      if (frame.empty()) {
-        emptyFrameCount++;
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        if (emptyFrameCount >= 90)
-          throw std::runtime_error("Falla crítica de video.");
-        continue;
-      }
-      emptyFrameCount = 0;
+      if (frame.empty())
+        break;
 
       cv::resize(frame, frame, cv::Size(640, 360));
       auto start = std::chrono::high_resolution_clock::now();
       int level = monitor.getDegradationLevel();
 
       vision.process(frame, effectEnabled, level);
-
-      if (effectEnabled && level < 3 && vision.hasValidEyes()) {
-        cv::Rect leftRoi = vision.getLeftEyeRoi();
-        cv::Rect rightRoi = vision.getRightEyeRoi();
-
-        if (leftRoi.area() > 0 && rightRoi.area() > 0) {
-          cv::Mat leftCrop = frame(leftRoi);
-          cv::Mat rightCrop = frame(rightRoi);
-
-          cv::Mat newLeftEye = inpainter.processEye(leftCrop);
-          cv::Mat newRightEye = inpainter.processEye(rightCrop);
-
-          if (!newLeftEye.empty() && newLeftEye.size() == leftRoi.size()) {
-            newLeftEye.copyTo(frame(leftRoi));
-          }
-          if (!newRightEye.empty() && newRightEye.size() == rightRoi.size()) {
-            newRightEye.copyTo(frame(rightRoi));
-          }
-        }
-      }
 
       videoSink->writeFrame(frame);
       auto end = std::chrono::high_resolution_clock::now();

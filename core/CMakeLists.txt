@@ -21,7 +21,7 @@ else()
     set(SINK_SOURCES src/video_sink_unix.cpp)
 endif()
 
-add_executable(directlook-daemon src/daemon.cpp src/vision_pipeline.cpp src/cpu_monitor.cpp ${IPC_SOURCES} ${SINK_SOURCES})
+add_executable(directlook-daemon src/daemon.cpp src/vision_pipeline.cpp src/temporal_filter.cpp src/geometry_engine.cpp src/cpu_monitor.cpp ${IPC_SOURCES} ${SINK_SOURCES})
 
 target_include_directories(directlook-daemon PRIVATE
     ${OpenCV_INCLUDE_DIRS}
