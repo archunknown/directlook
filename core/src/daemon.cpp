@@ -105,6 +105,7 @@ std::string resolveProjectFilePath(const std::string &fileName) {
 static constexpr size_t MEMORY_LIMIT_BYTES = 125 * 1024 * 1024;
 std::string MODEL_PATH;
 std::string FACE_MODEL_PATH;
+std::string IRIS_MODEL_PATH;
 
 size_t getProcessMemory() {
 #ifdef _WIN32
@@ -149,9 +150,11 @@ bool processIpcCommand(uint8_t byte, bool &effectEnabled) {
 int main(int argc, char **argv) {
   int cameraIndex = 0;
   int targetFps = 30;
+  bool useLiveCamera = false;
   for (int i = 1; i < argc; ++i) {
     if (std::string(argv[i]) == "--camera" && i + 1 < argc) {
       cameraIndex = std::stoi(argv[++i]);
+      useLiveCamera = true;
     } else if (std::string(argv[i]) == "--limit-fps" && i + 1 < argc) {
       targetFps = std::stoi(argv[++i]);
     }
@@ -162,6 +165,7 @@ int main(int argc, char **argv) {
   std::cout << "=== DirectLook Daemon [Windows] ===" << std::endl;
   MODEL_PATH = resolveModelPath("pfld.onnx");
   FACE_MODEL_PATH = resolveModelPath("version-slim-320_simplified.onnx");
+  IRIS_MODEL_PATH = resolveModelPath("iris_landmark.onnx");
   const std::string videoPath = resolveProjectFilePath("myface.mp4");
 
   std::unique_ptr<IpcServer> ipcServer =
@@ -174,16 +178,26 @@ int main(int argc, char **argv) {
   double total_latency = 0.0;
 
   try {
-    cap.open(videoPath);
-    if (!cap.isOpened())
-      throw std::runtime_error("Falla estructural: Archivo myface.mp4 inaccesible.");
+    if (useLiveCamera) {
+      cap.open(cameraIndex, cv::CAP_MSMF);
+      if (!cap.isOpened())
+        throw std::runtime_error("Falla: Cámara índice " + std::to_string(cameraIndex) + " inaccesible.");
+      cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
+      cap.set(cv::CAP_PROP_FRAME_HEIGHT, 360);
+      cap.set(cv::CAP_PROP_FPS, targetFps);
+      cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+      std::cout << "[CAMERA] Webcam abierta: indice " << cameraIndex << std::endl;
+    } else {
+      cap.open(videoPath);
+      if (!cap.isOpened())
+        throw std::runtime_error("Falla: Archivo myface.mp4 inaccesible.");
+    }
 
-    cap.set(cv::CAP_PROP_FPS, targetFps);
     double actualFps = cap.get(cv::CAP_PROP_FPS);
     if (actualFps <= 0)
       actualFps = targetFps;
 
-    VisionPipeline vision(FACE_MODEL_PATH, MODEL_PATH, actualFps);
+    VisionPipeline vision(FACE_MODEL_PATH, MODEL_PATH, IRIS_MODEL_PATH, actualFps);
 
     bool effectEnabled = true;
     uint8_t asyncCmdByte = 0;
@@ -214,14 +228,33 @@ int main(int argc, char **argv) {
       cv::resize(frame, frame, cv::Size(640, 360));
       auto start = std::chrono::high_resolution_clock::now();
       int level = monitor.getDegradationLevel();
-
       vision.process(frame, effectEnabled, level);
+      auto end = std::chrono::high_resolution_clock::now();
 
       videoSink->writeFrame(frame);
-      auto end = std::chrono::high_resolution_clock::now();
+      cv::imshow("DirectLook Preview", frame);
+      // Guardar un fotograma cada 5 segundos para inspeccion offline.
+      if (frames_processed % (static_cast<size_t>(targetFps) * 5) == 0 &&
+          frames_processed > 0) {
+        std::string filename =
+            "debug_frame_" + std::to_string(frames_processed) + ".png";
+        cv::imwrite(filename, frame);
+        std::cout << "[DEBUG] Frame guardado: " << filename << std::endl;
+      }
+      if (cv::waitKey(1) == 27) {
+        keepRunning.store(false);
+      }
       total_latency +=
           std::chrono::duration<double, std::milli>(end - start).count();
       frames_processed++;
+      if (frames_processed % 30 == 0) {
+        double avg = total_latency / frames_processed;
+        size_t mem = getProcessMemory();
+        std::cout << "[PIPELINE] Frame " << frames_processed
+                  << " | Latencia promedio: " << avg << " ms"
+                  << " | RAM: " << (mem / (1024 * 1024)) << " MB"
+                  << " | Degradacion: " << level << std::endl;
+      }
     }
     keepRunning.store(false);
     if (ipcWatchdog.joinable())
@@ -232,6 +265,7 @@ int main(int argc, char **argv) {
 
   ipcServer.reset();
   cap.release();
+  cv::destroyAllWindows();
   return 0;
 }
 
@@ -269,6 +303,7 @@ int main(int argc, char **argv) {
   std::cout << "=== DirectLook Daemon [Linux] ===" << std::endl;
   MODEL_PATH = resolveModelPath("pfld.onnx");
   FACE_MODEL_PATH = resolveModelPath("version-slim-320_simplified.onnx");
+  IRIS_MODEL_PATH = resolveModelPath("iris_landmark.onnx");
   videoSource = resolveProjectFilePath("myface.mp4");
 
   std::unique_ptr<IpcServer> ipcServer = std::make_unique<UnixSocketServer>();
@@ -294,7 +329,7 @@ int main(int argc, char **argv) {
     if (actualFps <= 0)
       actualFps = targetFps;
 
-    VisionPipeline vision(FACE_MODEL_PATH, MODEL_PATH, actualFps);
+    VisionPipeline vision(FACE_MODEL_PATH, MODEL_PATH, IRIS_MODEL_PATH, actualFps);
 
     bool effectEnabled = true;
     CpuMonitor monitor;
