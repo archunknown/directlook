@@ -3,12 +3,11 @@
 // =============================================================================
 
 #ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <shellapi.h>
 #include <atomic>
 #include <iostream>
-#include <shellapi.h>
 #include <thread>
-#include <windows.h>
 
 #define WM_TRAY_ICON (WM_USER + 1)
 #define WM_THERMAL_ALARM (WM_USER + 2)
@@ -24,7 +23,7 @@ NOTIFYICONDATA g_nid = {};
 
 // Hilo asíncrono para IPC
 static void ipc_worker() {
-  LPCSTR pipeName = "\\\\.\\pipe\\directlook_ipc";
+  LPCSTR pipeName = "\\\\.\\pipe\\directlook_pipe";
 
   while (is_running) {
     g_hPipe =
