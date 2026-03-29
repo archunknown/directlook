@@ -1,7 +1,6 @@
 // vision_pipeline.h
 #pragma once
 
-#include "geometry_engine.hpp"
 #include "temporal_filter.hpp"
 #include <chrono>
 #include <memory>
@@ -10,10 +9,19 @@
 #include <string>
 #include <vector>
 
+// Migrated from geometry_engine.hpp — still needed by estimateHeadPose.
+struct EulerAnglesDeg {
+  double pitch{0.0};
+  double yaw{0.0};
+  double roll{0.0};
+};
+
+#include "geometry_engine.hpp"
+
 class VisionPipeline {
 public:
   VisionPipeline(const std::string &faceModelPath, const std::string &modelPath,
-                 double fps = 30.0);
+                 const std::string &irisModelPath, double fps = 30.0);
   ~VisionPipeline();
 
   void process(cv::Mat &frame, bool effectEnabled, int degradationLevel);
@@ -41,6 +49,16 @@ private:
 
   std::string pfldOutputNameStr;
   const char *pfldOutputName{nullptr};
+
+  // Iris landmark session (MediaPipe iris_landmark.onnx — [1,3,64,64] → [1,15])
+  std::unique_ptr<Ort::Session> irisSession;
+  std::vector<float>            irisInputTensorValues; // 3 × 64 × 64
+  std::string irisInputNameStr;
+  const char *irisInputName{nullptr};
+  std::string irisOutputNameStr;  // "output_iris" → float[1,15]
+  const char *irisOutputName{nullptr};
+
+  cv::Point2f detectIrisPupil(const cv::Mat &eyeCrop64) const;
 
   std::vector<std::vector<float>> priors;
   void generatePriors(int img_w, int img_h);

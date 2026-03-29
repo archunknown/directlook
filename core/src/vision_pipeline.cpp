@@ -6,15 +6,17 @@
 #include <iostream>
 
 VisionPipeline::VisionPipeline(const std::string &faceModelPath,
-                               const std::string &modelPath, double fps)
+                               const std::string &modelPath,
+                               const std::string &irisModelPath, double fps)
     : env(ORT_LOGGING_LEVEL_WARNING, "DirectLookPipeline"),
       faceInputTensorValues(3 * 240 * 320, 0.0f),
       pfldInputTensorValues(3 * 112 * 112, 0.0f),
+      irisInputTensorValues(3 * 64 * 64, 0.0f),
       landmarkFilter_(OneEuroFilterConfig{fps > 0.0 ? fps : 30.0, 1.2, 0.02,
                                           1.0, 0.5}),
       nominalDtSeconds_(fps > 0.0 ? 1.0 / fps : 1.0 / 30.0) {
 
-  sessionOptions.SetIntraOpNumThreads(1);
+  sessionOptions.SetIntraOpNumThreads(4);
   sessionOptions.SetGraphOptimizationLevel(
       GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
 
@@ -64,9 +66,103 @@ VisionPipeline::VisionPipeline(const std::string &faceModelPath,
               << std::endl;
     throw;
   }
+
+  // --- Iris session (non-fatal: falls back to centre (32,32) if unavailable) ---
+  try {
+#ifdef _WIN32
+    std::wstring wIrisPath(irisModelPath.begin(), irisModelPath.end());
+    irisSession = std::make_unique<Ort::Session>(env, wIrisPath.c_str(), sessionOptions);
+#else
+    irisSession = std::make_unique<Ort::Session>(env, irisModelPath.c_str(), sessionOptions);
+#endif
+    Ort::AllocatorWithDefaultOptions irisAlloc;
+    auto irisInName = irisSession->GetInputNameAllocated(0, irisAlloc);
+    irisInputNameStr = irisInName.get();
+    irisInputName    = irisInputNameStr.c_str();
+    // Find output index for "output_iris" (index 0 on the MediaPipe model).
+    size_t irisNumOut = irisSession->GetOutputCount();
+    for (size_t i = 0; i < irisNumOut; ++i) {
+      auto outName = irisSession->GetOutputNameAllocated(i, irisAlloc);
+      std::string name = outName.get();
+      if (name == "output_iris") {
+        irisOutputNameStr = name;
+        irisOutputName    = irisOutputNameStr.c_str();
+        break;
+      }
+    }
+    if (!irisOutputName) {
+      // Fallback: use first output regardless of name.
+      auto out0 = irisSession->GetOutputNameAllocated(0, irisAlloc);
+      irisOutputNameStr = out0.get();
+      irisOutputName    = irisOutputNameStr.c_str();
+    }
+    std::cout << "[Iris] Modelo cargado: " << irisModelPath
+              << " | input=" << irisInputNameStr
+              << " | output=" << irisOutputNameStr << std::endl;
+  } catch (const Ort::Exception &e) {
+    std::cerr << "[Iris] Fallo al cargar iris_landmark.onnx — usando fallback (32,32): "
+              << e.what() << std::endl;
+    irisSession.reset();
+  }
 }
 
 VisionPipeline::~VisionPipeline() {}
+
+// ---------------------------------------------------------------------------
+// detectIrisPupil — runs iris_landmark.onnx on a 64×64 BGR crop.
+// Returns the iris centre in crop-local coordinates.
+// Falls back to (32,32) if the session is null or inference throws.
+// ---------------------------------------------------------------------------
+cv::Point2f VisionPipeline::detectIrisPupil(const cv::Mat &eyeCrop64) const {
+  const cv::Point2f kFallback(32.0f, 32.0f);
+  if (!irisSession || eyeCrop64.empty())
+    return kFallback;
+
+  // Prepare input: BGR→RGB, float32, normalised to [0,1], CHW layout.
+  cv::Mat rgb;
+  cv::cvtColor(eyeCrop64, rgb, cv::COLOR_BGR2RGB);
+
+  cv::Mat rgb64;
+  if (rgb.cols != 64 || rgb.rows != 64)
+    cv::resize(rgb, rgb64, cv::Size(64, 64));
+  else
+    rgb64 = rgb;
+
+  cv::Mat flt;
+  rgb64.convertTo(flt, CV_32FC3, 1.0f / 255.0f);
+
+  // Split into CHW.
+  cv::Mat chs[3];
+  for (int c = 0; c < 3; ++c)
+    chs[c] = cv::Mat(64, 64, CV_32FC1,
+                     const_cast<float *>(irisInputTensorValues.data()) + c * 64 * 64);
+  cv::split(flt, chs);
+
+  std::array<int64_t, 4> shape = {1, 3, 64, 64};
+  auto memInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+  Ort::Value inputTensor = Ort::Value::CreateTensor<float>(
+      memInfo,
+      const_cast<float *>(irisInputTensorValues.data()),
+      irisInputTensorValues.size(),
+      shape.data(), shape.size());
+
+  const char *inNames[]  = {irisInputName};
+  const char *outNames[] = {irisOutputName};
+
+  try {
+    auto outputs = irisSession->Run(
+        Ort::RunOptions{nullptr}, inNames, &inputTensor, 1, outNames, 1);
+    const float *iris = outputs[0].GetTensorData<float>();
+    // output_iris: [1, 15] — landmarks 0..4 each (x,y,z).
+    // Index 0 = iris centre x, index 1 = iris centre y, in 64×64 space.
+    float cx = std::clamp(iris[0], 0.0f, 63.0f);
+    float cy = std::clamp(iris[1], 0.0f, 63.0f);
+    return cv::Point2f(cx, cy);
+  } catch (const Ort::Exception &e) {
+    std::cerr << "[Iris] Inferencia falló: " << e.what() << std::endl;
+    return kFallback;
+  }
+}
 
 void VisionPipeline::resetTemporalState() {
   landmarkFilter_.reset();
@@ -76,11 +172,17 @@ void VisionPipeline::resetTemporalState() {
 bool VisionPipeline::estimateHeadPose(
     const OneEuroLandmarkFilter::LandmarkArray &stabilizedLandmarks,
     int frameWidth, int frameHeight, EulerAnglesDeg &headPoseDeg) const {
-  const std::array<int, 6> landmarkIndices = {16, 57, 60, 72, 76, 82};
+  // Standard 6-point set for 68-landmark models.
+  //   30=nose tip, 8=chin, 36=left eye outer, 45=right eye outer,
+  //   48=mouth left, 54=mouth right
+  const std::array<int, 6> landmarkIndices = {30, 8, 36, 45, 48, 54};
   const std::array<cv::Point3d, 6> modelPoints = {
-      cv::Point3d(0.0, 63.6, -12.5),   cv::Point3d(0.0, 0.0, 0.0),
-      cv::Point3d(-43.3, -32.7, -26.0), cv::Point3d(43.3, -32.7, -26.0),
-      cv::Point3d(-28.9, 28.9, -24.1), cv::Point3d(28.9, 28.9, -24.1)};
+      cv::Point3d(  0.0, -330.0,  -65.0),   // 30: nose tip
+      cv::Point3d(  0.0,  330.0,  -15.0),   // 8:  chin
+      cv::Point3d(-225.0, -170.0, -135.0),  // 36: left eye outer corner
+      cv::Point3d( 225.0, -170.0, -135.0),  // 45: right eye outer corner
+      cv::Point3d(-150.0,  150.0, -125.0),  // 48: mouth left corner
+      cv::Point3d( 150.0,  150.0, -125.0)}; // 54: mouth right corner
 
   std::vector<cv::Point2d> imagePoints;
   imagePoints.reserve(landmarkIndices.size());
@@ -176,6 +278,9 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
     return;
   }
 
+  // --- Diagnostic timing ---
+  const auto t0 = std::chrono::high_resolution_clock::now();
+
   int w_f = frame.cols;
   int h_f = frame.rows;
 
@@ -209,6 +314,7 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
     auto faceOutputTensors = faceSession->Run(
         Ort::RunOptions{nullptr}, faceInputNames, &faceInputTensor, 1,
         faceOutputNames.data(), faceOutputNames.size());
+    const auto t1 = std::chrono::high_resolution_clock::now();
 
     const float *scores = faceOutputTensors[0].GetTensorData<float>();
     const float *boxes = faceOutputTensors[1].GetTensorData<float>();
@@ -295,6 +401,7 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
     auto pfldOutputTensors =
         session->Run(Ort::RunOptions{nullptr}, pfldInputNames, &pfldInputTensor,
                      1, pfldOutputNames, 1);
+    const auto t2 = std::chrono::high_resolution_clock::now();
 
     const float *landmarks = pfldOutputTensors[0].GetTensorData<float>();
     OneEuroLandmarkFilter::LandmarkArray absoluteLandmarks{};
@@ -374,35 +481,127 @@ void VisionPipeline::process(cv::Mat &frame, bool effectEnabled,
       return cv::Rect();
     };
 
-    currentLeftRoi = create64x64Roi(60, 67);
-    currentRightRoi = create64x64Roi(68, 75);
+    currentLeftRoi  = create64x64Roi(36, 41);  // left eye:  6 pts (dlib-68 convention)
+    currentRightRoi = create64x64Roi(42, 47);  // right eye: 6 pts
 
     if (currentLeftRoi.area() > 0 && currentRightRoi.area() > 0) {
       validEyes = true;
 
       if (hasHeadPose) {
-        cv::Mat leftEyeCrop = frame(currentLeftRoi).clone();
-        cv::Mat rightEyeCrop = frame(currentRightRoi).clone();
+        float lastHRatio = 0.5f;
+        float lastVRatio = 0.5f;
+        double irisInfMs = 0.0;
 
-        auto blendEye = [&](const cv::Rect &roi, const cv::Mat &eyeCrop) {
-          cv::Mat renderedEye = geometryEngine_.renderEye(eyeCrop, headPoseDeg);
-          cv::Mat blendMask = geometryEngine_.createBlendMask(eyeCrop.size());
-          if (renderedEye.empty() || renderedEye.size() != eyeCrop.size() ||
-              renderedEye.type() != eyeCrop.type() || blendMask.empty()) {
-            return;
+        static cv::Point2f smoothedLeftGaze(0.5f, 0.5f);
+        static cv::Point2f smoothedRightGaze(0.5f, 0.5f);
+        constexpr float kSmoothingAlpha = 0.4f;
+
+        auto applyEye = [&](const cv::Rect &roi, int startIdx, int endIdx) {
+          cv::Mat eyeCrop = frame(roi).clone();
+
+          // Extract landmarks in ROI-local coordinates.
+          std::vector<cv::Point> localPts;
+          localPts.reserve(endIdx - startIdx + 1);
+          for (int i = startIdx; i <= endIdx; ++i) {
+            int lx = std::clamp(static_cast<int>(std::round(
+                stabilizedLandmarks[i * 2] - roi.x)), 0, 63);
+            int ly = std::clamp(static_cast<int>(std::round(
+                stabilizedLandmarks[i * 2 + 1] - roi.y)), 0, 63);
+            localPts.push_back({lx, ly});
           }
 
-          const cv::Point center(roi.x + roi.width / 2, roi.y + roi.height / 2);
-          cv::Mat blendedFrame;
-          cv::seamlessClone(renderedEye, frame, blendMask, center, blendedFrame,
-                            cv::NORMAL_CLONE);
-          frame = blendedFrame;
+          // Eye corners in absolute frame coordinates.
+          // 68-landmark: left eye outer=36, inner=39; right eye outer=42, inner=45.
+          int outerIdx = startIdx;      // 36 or 42: outer corner
+          int innerIdx = startIdx + 3;  // 39 or 45: inner corner
+
+          cv::Point2f outerCorner(stabilizedLandmarks[outerIdx * 2],
+                                  stabilizedLandmarks[outerIdx * 2 + 1]);
+          cv::Point2f innerCorner(stabilizedLandmarks[innerIdx * 2],
+                                  stabilizedLandmarks[innerIdx * 2 + 1]);
+
+          // Vertical centre of the eye (mean of upper and lower eyelid pairs).
+          float upperY = (stabilizedLandmarks[(startIdx + 1) * 2 + 1] +
+                          stabilizedLandmarks[(startIdx + 2) * 2 + 1]) * 0.5f;
+          float lowerY = (stabilizedLandmarks[(startIdx + 4) * 2 + 1] +
+                          stabilizedLandmarks[(startIdx + 5) * 2 + 1]) * 0.5f;
+
+          // Detect iris centre using MediaPipe model; convert to absolute frame coords.
+          const auto tIris0 = std::chrono::high_resolution_clock::now();
+          cv::Point2f pupilLocal = detectIrisPupil(eyeCrop);
+          const auto tIris1 = std::chrono::high_resolution_clock::now();
+          irisInfMs += std::chrono::duration<double, std::milli>(tIris1 - tIris0).count();
+          cv::Point2f pupilAbs(pupilLocal.x + roi.x, pupilLocal.y + roi.y);
+
+          // Horizontal gaze ratio: 0.0 = outer corner, 1.0 = inner corner.
+          float eyeWidth = cv::norm(innerCorner - outerCorner);
+          float hRatio = 0.5f;
+          if (eyeWidth > 5.0f) {
+            cv::Point2f eyeVec   = innerCorner - outerCorner;
+            cv::Point2f pupilVec = pupilAbs    - outerCorner;
+            hRatio = (pupilVec.x * eyeVec.x + pupilVec.y * eyeVec.y) /
+                     (eyeVec.x  * eyeVec.x  + eyeVec.y  * eyeVec.y);
+            hRatio = std::clamp(hRatio, 0.0f, 1.0f);
+          }
+
+          // Vertical gaze ratio: 0.0 = upper lid, 1.0 = lower lid.
+          float eyeHeight = lowerY - upperY;
+          float vRatio = 0.5f;
+          if (eyeHeight > 3.0f) {
+            vRatio = (pupilAbs.y - upperY) / eyeHeight;
+            vRatio = std::clamp(vRatio, 0.0f, 1.0f);
+          }
+
+          // Exponential smoothing of gaze ratios.
+          cv::Point2f &smoothedGaze =
+              (startIdx == 36) ? smoothedLeftGaze : smoothedRightGaze;
+          smoothedGaze.x = kSmoothingAlpha * hRatio +
+                           (1.0f - kSmoothingAlpha) * smoothedGaze.x;
+          smoothedGaze.y = kSmoothingAlpha * vRatio +
+                           (1.0f - kSmoothingAlpha) * smoothedGaze.y;
+
+          // Deviation from 0.5 → pixel displacement in the 64×64 crop.
+          constexpr float kHorizontalStrength = 40.0f;
+          constexpr float kVerticalStrength   = 35.0f;
+
+          // Punto neutral calibrado empíricamente
+          // (valores medidos cuando el usuario mira directamente a la cámara)
+          constexpr float kNeutralH = 0.54f;
+          constexpr float kNeutralV = 0.35f;
+
+          float dx = (kNeutralH - smoothedGaze.x) * kHorizontalStrength;
+          float dy = (kNeutralV - smoothedGaze.y) * kVerticalStrength;
+          dx = std::clamp(dx, -14.0f, 14.0f);
+          dy = std::clamp(dy, -14.0f, 14.0f);
+
+          cv::Mat corrected =
+              geometryEngine_.applyDisplacement(eyeCrop, localPts, dx, dy);
+          if (!corrected.empty())
+            corrected.copyTo(frame(roi));
+
+          lastHRatio = smoothedGaze.x;
+          lastVRatio = smoothedGaze.y;
         };
 
-        blendEye(currentLeftRoi, leftEyeCrop);
-        blendEye(currentRightRoi, rightEyeCrop);
+        applyEye(currentLeftRoi,  36, 41);
+        applyEye(currentRightRoi, 42, 47);
+        const auto t3 = std::chrono::high_resolution_clock::now();
+
+        static int diagCounter = 0;
+        if (++diagCounter % 30 == 0) {
+          using ms = std::chrono::duration<double, std::milli>;
+          std::cout << "[DIAG] UltraFace: " << ms(t1 - t0).count()
+                    << "ms | PFLD: "          << ms(t2 - t1).count()
+                    << "ms | Iris: "          << irisInfMs
+                    << "ms | GeometryEngine: " << ms(t3 - t2).count() - irisInfMs
+                    << "ms | Total: "         << ms(t3 - t0).count()
+                    << "ms | Gaze: h="        << lastHRatio
+                    << " v=" << lastVRatio << std::endl;
+        }
       }
     }
+
+
 
   } catch (const Ort::Exception &e) {
     std::cerr << "[Pipeline] Hardware ONNX abortado geométricamente: "
